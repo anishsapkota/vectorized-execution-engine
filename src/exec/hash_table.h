@@ -25,6 +25,7 @@ class AggHashTable {
     Value& find_or_insert(int64_t key);
 
     std::size_t size() const { return size_; }
+    std::size_t capacity() const { return capacity_; }
 
     // Iterate all live entries. Callback signature: (int64_t key, const Value& val).
     template <typename F>
