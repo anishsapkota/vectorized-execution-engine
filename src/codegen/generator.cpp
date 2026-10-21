@@ -275,13 +275,14 @@ class Generator {
         const auto in = plan::output_types(*agg.child);
         for (std::size_t i = 0; i < agg.aggs.size(); ++i) {
             const plan::AggExpr& e = agg.aggs[i];
-            if (e.fn == plan::AggFn::Median) throw CodegenError("codegen: aggregate median not supported yet");
             if (e.fn == plan::AggFn::Count) {
                 fields_.push_back({e.fn, true, 0, ""});
                 continue;
             }
-            const bool sum_like = e.fn == plan::AggFn::Sum || e.fn == plan::AggFn::Avg;
-            fields_.push_back({e.fn, in[*e.col] == DataType::Int64, *e.col, (sum_like ? "s" : "m") + std::to_string(i)});
+            const bool        sum_like = e.fn == plan::AggFn::Sum || e.fn == plan::AggFn::Avg;
+            const std::string prefix   = e.fn == plan::AggFn::Median ? "med" : sum_like ? "s" : "m";
+            fields_.push_back({e.fn, in[*e.col] == DataType::Int64, *e.col, prefix + std::to_string(i)});
+            has_median_ = has_median_ || e.fn == plan::AggFn::Median;
         }
     }
 
@@ -291,8 +292,10 @@ class Generator {
         return "double";
     }
 
-    // Per-tuple update of Row `r` (a group's record, or the global accumulator).
-    void emit_updates(const std::string& r, const std::vector<std::string>& vals) {
+    static bool in_row(const Field& f) { return f.fn != plan::AggFn::Count && f.fn != plan::AggFn::Median; }
+
+    // Per-tuple update of Row `r` (a group's record, or the global accumulator) for group `gid`.
+    void emit_updates(const std::string& r, const std::string& gid, const std::vector<std::string>& vals) {
         cur().body.line("++" + r + ".count;");
         for (std::size_t i = 0; i < fields_.size(); ++i) {
             const Field& f = fields_[i];
@@ -308,6 +311,9 @@ class Generator {
                     break;
                 case plan::AggFn::Max:
                     cur().body.line("if (" + v + " > " + m + " || " + v + " != " + v + ") " + m + " = " + v + ";");
+                    break;
+                case plan::AggFn::Median:
+                    cur().body.line("st." + f.name + ".append(" + gid + ", " + v + ");");
                     break;
                 default:
                     break;
@@ -326,7 +332,7 @@ class Generator {
             std::string       init = "Row{0";  // new group: count 0, sums 0, MIN/MAX at this row's value
             for (std::size_t i = 0; i < fields_.size(); ++i) {
                 const Field& f = fields_[i];
-                if (f.fn == plan::AggFn::Count) continue;
+                if (!in_row(f)) continue;
                 init += (f.fn == plan::AggFn::Sum || f.fn == plan::AggFn::Avg) ? ", 0" : ", " + vals[i];
             }
             init += "}";
@@ -334,7 +340,7 @@ class Generator {
             cur().body.line("const uint32_t g = st.groups.find_or_insert(" + key + ");");
             cur().body.line("if (g == st.rows.size) st.rows.push(" + init + ");");
             cur().body.line("Row& e = st.rows.data[g];");
-            emit_updates("e", vals);
+            emit_updates("e", "g", vals);
             cur().body.close();
             return;
         }
@@ -351,14 +357,16 @@ class Generator {
             if (f.fn == plan::AggFn::Min || f.fn == plan::AggFn::Max) first += " acc." + f.name + " = " + vals[i] + ";";
         }
         if (!first.empty()) cur().body.line("if (acc.count == 0) {" + first + " }");
-        emit_updates("acc", vals);
+        emit_updates("acc", "0u", vals);
     }
 
     // Serializes one group's Row into an output row; returns 3 on SUM(INT64) overflow.
     void emit_group_function(CodeWriter& w) {
         const std::size_t n = fields_.size() + (grouped_ ? 1 : 0);
         w.line("");
-        w.open("int emit_group(const Row& r, int64_t key, uint8_t global, wb_rt::QueryOutput* out) {");
+        w.open("int emit_group(const State& st, uint32_t g, const Row& r, int64_t key, uint8_t global, wb_rt::QueryOutput* out) {");
+        w.line("(void)st;");
+        w.line("(void)g;");
         w.line("uint64_t row[" + std::to_string(n) + "];");
         std::size_t c = 0;
         if (grouped_) w.line("row[" + std::to_string(c++) + "] = static_cast<uint64_t>(key);");
@@ -391,6 +399,7 @@ class Generator {
                     w.line(slot + (f.is_int ? "static_cast<uint64_t>(" + m + ");" : "__builtin_bit_cast(uint64_t, " + m + ");"));
                     break;
                 case plan::AggFn::Median:
+                    w.line(slot + "__builtin_bit_cast(uint64_t, st.medv" + f.name.substr(3) + "[g]);");
                     break;
             }
         }
@@ -409,18 +418,23 @@ class Generator {
         w.open("struct Row {");
         w.line("int64_t count;");
         for (const Field& f : fields_)
-            if (f.fn != plan::AggFn::Count) w.line(field_type(f) + " " + f.name + ";");
+            if (in_row(f)) w.line(field_type(f) + " " + f.name + ";");
         w.close("};");
-        emit_group_function(w);
         w.line("");
         w.open("struct State {");
         w.line("Row acc{};  // global aggregate");
+        for (const Field& f : fields_) {
+            if (f.fn != plan::AggFn::Median) continue;
+            w.line(std::string{"wb_rt::MedianBuffer<"} + (f.is_int ? "int64_t" : "double") + "> " + f.name + ";");
+            w.line("double* medv" + f.name.substr(3) + " = nullptr;  // per-group medians after finalize");
+        }
         w.line("wb_rt::GroupTable groups;");
         w.line("wb_rt::StateRows<Row> rows;");
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
             w.line("wb_rt::JoinTable jt" + std::to_string(id) + ";");
         w.close("};");
 
+        emit_group_function(w);
         for (const auto& pipeline : pipelines_)
             emit_pipeline(w, *pipeline);
 
@@ -441,10 +455,31 @@ class Generator {
             for (const auto& stmt : pipeline->after_run)
                 w.line(stmt);
         }
+        const std::string ngroups = grouped_ ? "st.rows.size" : "(st.acc.count > 0 ? 1u : 0u)";
+        if (has_median_) {
+            w.open("if (rc == 0) {");
+            w.line("const uint32_t ngroups = " + ngroups + ";");
+            w.line("int64_t* counts = static_cast<int64_t*>(__builtin_malloc((ngroups ? ngroups : 1) * sizeof(int64_t)));");
+            w.line(std::string{"for (uint32_t g = 0; g < ngroups; ++g) counts[g] = "} +
+                   (grouped_ ? "st.rows.data[g].count;" : "st.acc.count;"));
+            for (const Field& f : fields_) {
+                if (f.fn != plan::AggFn::Median) continue;
+                const std::string v = "st.medv" + f.name.substr(3);
+                w.line(v + " = static_cast<double*>(__builtin_malloc((ngroups ? ngroups : 1) * sizeof(double)));");
+                w.line("st." + f.name + ".finalize(counts, ngroups, " + v + ");");
+            }
+            w.line("__builtin_free(counts);");
+            w.close();
+        }
         if (grouped_) {
-            w.line("for (uint32_t g = 0; rc == 0 && g < st.rows.size; ++g) rc = emit_group(st.rows.data[g], st.groups.key_of(g), 0, out);");
+            w.line("for (uint32_t g = 0; rc == 0 && g < st.rows.size; ++g) rc = emit_group(st, g, st.rows.data[g], st.groups.key_of(g), 0, out);");
         } else {
-            w.line("if (rc == 0 && st.acc.count > 0) rc = emit_group(st.acc, 0, 1, out);  // empty: host adds the NULL row");
+            w.line("if (rc == 0 && st.acc.count > 0) rc = emit_group(st, 0, st.acc, 0, 1, out);  // empty: host adds the NULL row");
+        }
+        for (const Field& f : fields_) {
+            if (f.fn != plan::AggFn::Median) continue;
+            w.line("st." + f.name + ".release();");
+            w.line("__builtin_free(st.medv" + f.name.substr(3) + ");");
         }
         if (grouped_) {
             w.line("st.groups.release();");
@@ -510,6 +545,7 @@ class Generator {
     std::size_t                             counter_   = 0;
     bool                                    grouped_   = false;
     std::vector<Field>                      fields_;  // one per aggregate, in order
+    bool                                    has_median_ = false;
     std::vector<std::size_t>                join_cols_;  // payload columns per join table
     std::vector<bool>                       finalized_;  // finalize() already scheduled
 };

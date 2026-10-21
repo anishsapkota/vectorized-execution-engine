@@ -513,3 +513,46 @@ TEST(cg_count_only) {
     check_engines_agree(*aggregate(scan(*t, {0}), 0, {{AggFn::Count, std::nullopt}}));
     check_engines_agree(*aggregate(scan(*t, {0}), std::nullopt, {{AggFn::Count, std::nullopt}}));
 }
+
+TEST(cg_median_matrix) {
+    fresh_cache_dir();
+    auto d = make_kv_double(median_double_rows(), 5);
+    auto i = make_table("t", median_int_rows(), 5);
+    auto x = make_table("t", int64_extreme_rows());
+    auto n = make_kv_double(nan_median_rows());
+    for (const Table* t : {d.get(), i.get(), x.get(), n.get()}) {
+        check_engines_agree(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+        check_engines_agree(*aggregate(scan(*t, {0, 1}), std::nullopt, {{AggFn::Median, 1}}));
+    }
+    auto r        = make_readings(50'000);
+    auto [lo, hi] = ts_range(*r);
+    check_engines_agree(*aggregate(scan(*r, {0, 2}), 0, {{AggFn::Median, 1}}));
+    check_engines_agree(
+        *aggregate(filter(scan(*r, {1, 2}), {{0, CompareOp::Gt, lo + (hi - lo) / 2}}), std::nullopt, {{AggFn::Median, 1}}));
+    check_engines_agree(*aggregate(filter(scan(*r, {1, 2}), {{0, CompareOp::Gt, hi}}), std::nullopt, {{AggFn::Median, 1}}));
+}
+
+TEST(cg_many_aggs_same_and_different_columns) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000);
+    check_engines_agree(*aggregate(scan(*t, {0, 1, 2}), 0,
+                                   {{AggFn::Min, 2}, {AggFn::Max, 2}, {AggFn::Median, 2}, {AggFn::Median, 1},
+                                    {AggFn::Avg, 1}, {AggFn::Count, std::nullopt}}));
+    check_engines_agree(*aggregate(scan(*t, {0, 1, 2}), std::nullopt,
+                                   {{AggFn::Median, 2}, {AggFn::Median, 1}, {AggFn::Min, 2}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(cg_group_column_aggregated) {
+    fresh_cache_dir();
+    auto t = make_readings(20'000);
+    check_engines_agree(*aggregate(scan(*t, {0, 2}), 0,
+                                   {{AggFn::Min, 0}, {AggFn::Max, 0}, {AggFn::Median, 0}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(cg_median_above_join) {
+    fresh_cache_dir();
+    auto orders    = make_orders(200'000, 10'000, 1.0);
+    auto customers = make_customers(10'000);
+    check_engines_agree(*aggregate(join(filter(scan(*orders, {0, 1}), {{1, CompareOp::Gt, 50.0}}), scan(*customers, {0, 1}), 0, 0),
+                                   3, {{AggFn::Avg, 1}, {AggFn::Median, 1}}));
+}
