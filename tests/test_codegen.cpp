@@ -341,6 +341,8 @@ TEST(empty_table_cg) {
     auto       t      = make_readings(0);
     const auto global = check_engines_agree(*sum_count(scan(*t, {2}), std::nullopt, 0));
     CHECK_EQ(global.num_rows(), std::size_t{1});
+    CHECK(global.is_null(0, 0));  // SQL: SUM over no rows is NULL
+    CHECK_EQ(global.int_at(1, 0), int64_t{0});
     CHECK_EQ(check_engines_agree(*sum_count(scan(*t, {0, 2}), 0, 1)).num_rows(), std::size_t{0});
 }
 

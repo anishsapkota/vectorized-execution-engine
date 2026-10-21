@@ -1,5 +1,8 @@
 // Logical plan IR, its type checker, and lowering to the vectorized engine.
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -123,34 +126,116 @@ std::vector<Row> reference_rows(const Node& node) {
     return out;
 }
 
-QueryResult reference(const Node& root) {
-    const auto& agg = std::get<SumCount>(root.op);
-    QueryResult r;
-    r.grouped = agg.group_col.has_value();
-    std::map<int64_t, std::size_t> slot;  // key -> row in r
-    std::vector<int64_t>           keys, counts;
-    std::vector<double>            sums;
-    if (!r.grouped) {
-        sums   = {0.0};
-        counts = {0};
+// Every aggregate computed the obvious way over each group's rows, in scan order. Must agree
+// exactly with spec section 3; both engines are checked against this.
+bool less_nan_last(double a, double b) { return !std::isnan(a) && (std::isnan(b) || a < b); }
+
+void reference_aggregate(const AggExpr& e, DataType in, const std::vector<const Row*>& rows, bool grouped,
+                         int64_t key, ResultColumn& out) {
+    const std::size_t n = rows.size();
+    if (e.fn == AggFn::Count) return out.push_int(static_cast<int64_t>(n));
+    if (n == 0) {  // global aggregate over no rows
+        if (in == DataType::Int64 && (e.fn == AggFn::Sum || e.fn == AggFn::Min || e.fn == AggFn::Max)) {
+            return out.push_int(0, false);
+        }
+        return out.push_double(0.0, false);
     }
-    for (const auto& row : reference_rows(*agg.child)) {
+    const std::size_t c = *e.col;
+    if (in == DataType::Int64) {
+        std::vector<int64_t> v;
+        for (const Row* r : rows)
+            v.push_back((*r)[c].i);
+        __int128 sum = 0;
+        for (int64_t x : v)
+            sum += x;
+        switch (e.fn) {
+            case AggFn::Sum:
+                if (sum > INT64_MAX || sum < INT64_MIN) {
+                    throw std::overflow_error("SUM overflow in group " + (grouped ? std::to_string(key) : "global"));
+                }
+                return out.push_int(static_cast<int64_t>(sum));
+            case AggFn::Min:
+                return out.push_int(*std::min_element(v.begin(), v.end()));
+            case AggFn::Max:
+                return out.push_int(*std::max_element(v.begin(), v.end()));
+            case AggFn::Avg:
+                return out.push_double(static_cast<double>(sum) / static_cast<double>(n));
+            case AggFn::Median: {
+                std::sort(v.begin(), v.end());
+                return out.push_double(n % 2 ? static_cast<double>(v[n / 2])
+                                             : (static_cast<double>(v[n / 2 - 1]) + static_cast<double>(v[n / 2])) / 2.0);
+            }
+            case AggFn::Count:
+                break;
+        }
+    }
+    std::vector<double> v;
+    for (const Row* r : rows)
+        v.push_back((*r)[c].d);
+    double sum = 0.0;  // starts at +0.0; every row adds
+    for (double x : v)
+        sum += x;
+    switch (e.fn) {
+        case AggFn::Sum:
+            return out.push_double(sum);
+        case AggFn::Min: {
+            double m = v[0];
+            for (double x : v)
+                if (x < m || x != x) m = x;
+            return out.push_double(m);
+        }
+        case AggFn::Max: {
+            double m = v[0];
+            for (double x : v)
+                if (x > m || x != x) m = x;
+            return out.push_double(m);
+        }
+        case AggFn::Avg:
+            return out.push_double(sum / static_cast<double>(n));
+        case AggFn::Median:
+            std::sort(v.begin(), v.end(), less_nan_last);
+            return out.push_double(n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0);
+        case AggFn::Count:
+            break;
+    }
+}
+
+QueryResult reference(const Node& root) {
+    const auto& agg   = std::get<Aggregate>(root.op);
+    const auto  in    = output_types(*agg.child);
+    const auto  types = output_types(root);
+    const auto  rows  = reference_rows(*agg.child);
+
+    // Group rows in first-seen order; a global aggregate is one (possibly empty) group.
+    std::map<int64_t, std::size_t>        slot;
+    std::vector<int64_t>                  keys;
+    std::vector<std::vector<const Row*>> groups;
+    if (!agg.group_col) groups.emplace_back();
+    for (const Row& row : rows) {
         std::size_t at = 0;
-        if (r.grouped) {
+        if (agg.group_col) {
             auto [it, fresh] = slot.try_emplace(row[*agg.group_col].i, keys.size());
             if (fresh) {
                 keys.push_back(it->first);
-                sums.push_back(0.0);
-                counts.push_back(0);
+                groups.emplace_back();
             }
             at = it->second;
         }
-        sums[at] += row[agg.sum_col].d;
-        ++counts[at];
+        groups[at].push_back(&row);
     }
-    if (r.grouped) r.columns.push_back(int_column(keys));
-    r.columns.push_back(double_column(sums));
-    r.columns.push_back(int_column(counts));
+
+    QueryResult r;
+    r.grouped = agg.group_col.has_value();
+    for (DataType t : types)
+        r.columns.push_back({t, {}, {}, {}});
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+        std::size_t c = 0;
+        if (r.grouped) r.columns[c++].push_int(keys[g]);
+        for (const AggExpr& e : agg.aggs) {
+            const DataType input = e.col ? in[*e.col] : DataType::Int64;
+            reference_aggregate(e, input, groups[g], r.grouped, r.grouped ? keys[g] : 0, r.columns[c++]);
+        }
+    }
     r.canonicalize();
     return r;
 }
@@ -231,7 +316,6 @@ TEST(plan_rejects_invalid) {
     CHECK(throws_invalid([&] { output_types(*scan(s, {0})); }));                     // String column
     CHECK(throws_invalid([&] { output_types(*filter(scan(t, {0}), {{0, CompareOp::Gt, 1.0}})); }));
     CHECK(throws_invalid([&] { output_types(*sum_count(scan(t, {2, 2}), 0, 1)); }));  // Float64 group
-    CHECK(throws_invalid([&] { output_types(*sum_count(scan(t, {0, 1}), 0, 1)); }));  // Int64 sum
     CHECK(throws_invalid([&] { output_types(*scan(t, {9})); }));                      // bad table col
     CHECK(throws_invalid([&] { output_types(*filter(scan(t, {0}), {{9, CompareOp::Gt, int64_t{1}}})); }));
     CHECK(throws_invalid([&] { output_types(*filter(scan(t, {0}), {})); }));          // empty AND
@@ -245,7 +329,7 @@ TEST(plan_rejects_invalid) {
 TEST(plan_to_string) {
     const Table t = readings_schema_table();
     CHECK_EQ(to_string(*sum_count(filter(scan(t, {0, 2}), {{0, CompareOp::Gt, int64_t{5000}}}), 0, 1)),
-             std::string{"SumCount(group=0,sum=1, Filter([0>5000], Scan(readings,[0,2])))"});
+             std::string{"Aggregate(group=0,[sum(1),count], Filter([0>5000], Scan(readings,[0,2])))"});
 }
 
 TEST(vec_global_filter_sum) {
@@ -300,7 +384,7 @@ TEST(empty_table_vec) {
     auto global = run_vectorized(*sum_count(scan(*t, {2}), std::nullopt, 0));
     CHECK_EQ(global.num_rows(), std::size_t{1});
     CHECK_EQ(global.int_at(1, 0), int64_t{0});
-    CHECK_EQ(global.double_at(0, 0), 0.0);
+    CHECK(global.is_null(0, 0));  // SQL: SUM over no rows is NULL
     CHECK_EQ(run_vectorized(*sum_count(scan(*t, {0, 2}), 0, 1)).num_rows(), std::size_t{0});
 }
 
@@ -316,4 +400,56 @@ TEST(vec_int64_min_group_key) {
     }
     t.add_segment(b.seal(std::nullopt, 1024));
     check_matches_reference(*sum_count(scan(t, {0, 1}), 0, 1));
+}
+
+TEST(plan_aggregate_rejects_invalid) {
+    const Table t = readings_schema_table();
+    CHECK(throws_invalid([&] { output_types(*aggregate(scan(t, {0, 2}), 0, {{AggFn::Count, 0}})); }));
+    CHECK(throws_invalid([&] { output_types(*aggregate(scan(t, {0, 2}), 0, {{AggFn::Min, std::nullopt}})); }));
+    CHECK(throws_invalid([&] { output_types(*aggregate(scan(t, {0, 2}), 0, {{AggFn::Max, 9}})); }));
+    CHECK(throws_invalid([&] { output_types(*aggregate(scan(t, {0, 2}), 0, {})); }));
+    CHECK(throws_invalid([&] { output_types(*aggregate(scan(t, {2, 0}), 0, {{AggFn::Count, std::nullopt}})); }));
+    CHECK(throws_invalid([&] {
+        validate_query(*aggregate(filter(aggregate(scan(t, {0, 2}), 0, {{AggFn::Count, std::nullopt}}),
+                                         {{0, CompareOp::Gt, int64_t{1}}}),
+                                  0, {{AggFn::Count, std::nullopt}}));
+    }));
+}
+
+TEST(plan_aggregate_output_types) {
+    const Table t = readings_schema_table();
+    using V       = std::vector<DataType>;
+    const auto q  = aggregate(scan(t, {0, 2}), 0,
+                              {{AggFn::Min, 0}, {AggFn::Max, 1}, {AggFn::Avg, 0}, {AggFn::Median, 1},
+                               {AggFn::Sum, 0}, {AggFn::Sum, 1}, {AggFn::Count, std::nullopt}});
+    CHECK(output_types(*q) == (V{DataType::Int64, DataType::Int64, DataType::Float64, DataType::Float64,
+                                 DataType::Float64, DataType::Int64, DataType::Float64, DataType::Int64}));
+}
+
+TEST(plan_aggregate_to_string) {
+    const Table t = readings_schema_table();
+    CHECK_EQ(to_string(*sum_count(scan(t, {0, 2}), 0, 1)),
+             std::string{"Aggregate(group=0,[sum(1),count], Scan(readings,[0,2]))"});
+    CHECK_EQ(to_string(*aggregate(scan(t, {2}), std::nullopt, {{AggFn::Median, 0}, {AggFn::Avg, 0}})),
+             std::string{"Aggregate(group=none,[median(0),avg(0)], Scan(readings,[2]))"});
+}
+
+TEST(reference_median_and_nulls) {
+    Schema schema{{"k", DataType::Int64}, {"v", DataType::Float64}};
+    Table  t{"t", schema};
+    SegmentBuilder b{schema};
+    for (double v : {3.0, 1.0, std::numeric_limits<double>::quiet_NaN(), 2.0}) {
+        b.append_int64(0, 1);
+        b.append_float64(1, v);
+    }
+    t.add_segment(b.seal(std::nullopt, 1024));
+    // Sorted with NaN last: 1, 2, 3, NaN -> median = (2 + 3) / 2.
+    const auto r = reference(*aggregate(scan(t, {0, 1}), 0, {{AggFn::Median, 1}}));
+    CHECK_EQ(r.double_at(1, 0), 2.5);
+
+    Table      empty{"e", schema};
+    const auto g = reference(*aggregate(scan(empty, {0, 1}), std::nullopt, {{AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+    CHECK_EQ(g.num_rows(), std::size_t{1});
+    CHECK(g.is_null(0, 0));
+    CHECK_EQ(g.int_at(1, 0), int64_t{0});
 }

@@ -44,7 +44,7 @@ void collect_scans(const plan::Node& node, const plan::Filter* parent_filter, st
         collect_scans(*j->build, nullptr, out);
         collect_scans(*j->probe, nullptr, out);
     } else {
-        collect_scans(*std::get<plan::SumCount>(node.op).child, nullptr, out);
+        collect_scans(*std::get<plan::Aggregate>(node.op).child, nullptr, out);
     }
 }
 
@@ -132,9 +132,10 @@ class Generator {
     Generator(const plan::Node& root, const std::vector<ScanBinding>& scans) : root_(root), scans_(scans) {}
 
     std::string run() {
-        const auto& agg = std::get<plan::SumCount>(root_.op);
+        const auto& agg = std::get<plan::Aggregate>(root_.op);
         grouped_        = agg.group_col.has_value();
-        produce(*agg.child, [&](Ctx& ctx) { consume_sum_count(agg, ctx); });
+        sum_col_        = supported_sum_col(agg);
+        produce(*agg.child, [&](Ctx& ctx) { consume_aggregate(agg, ctx); });
         if (next_scan_ != scans_.size()) throw CodegenError("codegen: scan bindings do not match the plan");
         return assemble();
     }
@@ -150,7 +151,7 @@ class Generator {
             return produce(*f->child, [&, f](Ctx& ctx) { consume_filter(*f, ctx, consume); });
         }
         if (const auto* j = std::get_if<plan::HashJoin>(&node.op)) return produce_join(*j, consume);
-        throw CodegenError("codegen: SumCount is only supported at the root");
+        throw CodegenError("codegen: Aggregate is only supported at the root");
     }
 
     void produce_scan(const plan::Scan& s, const Consumer& consume) {
@@ -262,10 +263,25 @@ class Generator {
         consume(ctx);
     }
 
-    void consume_sum_count(const plan::SumCount& agg, Ctx& ctx) {
+    // Until the generator is generalized: at least one Sum, all on one Float64 column, plus Counts.
+    static std::size_t supported_sum_col(const plan::Aggregate& agg) {
+        const auto                 types = plan::output_types(*agg.child);
+        std::optional<std::size_t> col;
+        for (const plan::AggExpr& e : agg.aggs) {
+            if (e.fn == plan::AggFn::Count) continue;
+            if (e.fn != plan::AggFn::Sum || types[*e.col] != DataType::Float64 || (col && *col != *e.col)) {
+                throw CodegenError(std::string{"codegen: aggregate "} + plan::agg_fn_name(e.fn) + " not supported yet");
+            }
+            col = e.col;
+        }
+        if (!col) throw CodegenError("codegen: aggregate count not supported yet");
+        return *col;
+    }
+
+    void consume_aggregate(const plan::Aggregate& agg, Ctx& ctx) {
         if (agg.group_col) {
             const std::string key = ctx[*agg.group_col].get();
-            const std::string val = ctx[agg.sum_col].get();
+            const std::string val = ctx[sum_col_].get();
             cur().body.open("{");
             cur().body.line("wb_rt::AggSlot& e = st.agg.find_or_insert(" + key + ");");
             cur().body.line("e.sum += " + val + ";");
@@ -282,7 +298,7 @@ class Generator {
             cur().epilogue.push_back("st.sum = acc_sum;");
             cur().epilogue.push_back("st.count = acc_count;");
         }
-        const std::string val = ctx[agg.sum_col].get();
+        const std::string val = ctx[sum_col_].get();
         cur().body.line("acc_sum += " + val + ";");
         cur().body.line("++acc_count;");
     }
@@ -389,6 +405,7 @@ class Generator {
     std::size_t                             next_scan_ = 0;
     std::size_t                             counter_   = 0;
     bool                                    grouped_   = false;
+    std::size_t                             sum_col_   = 0;
     std::vector<std::size_t>                join_cols_;  // payload columns per join table
     std::vector<bool>                       finalized_;  // finalize() already scheduled
 };

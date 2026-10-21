@@ -60,12 +60,20 @@ void bind_inputs(const std::vector<ScanBinding>& bindings, BoundInput& bound) {
     bound.input = {bound.scans.data(), static_cast<uint32_t>(bound.scans.size())};
 }
 
+struct Collector {
+    plan::QueryResult*      result;
+    const plan::Aggregate*  agg;
+};
+
 void collect_group(void* ctx, int64_t key, double sum, int64_t count) {
-    auto*       r = static_cast<plan::QueryResult*>(ctx);
-    std::size_t c = 0;
-    if (r->grouped) r->columns[c++].push_int(key);
-    r->columns[c++].push_double(sum);
-    r->columns[c].push_int(count);
+    auto*       c = static_cast<Collector*>(ctx);
+    std::size_t i = 0;
+    if (c->result->grouped) c->result->columns[i++].push_int(key);
+    for (const plan::AggExpr& e : c->agg->aggs) {
+        auto& col = c->result->columns[i++];
+        if (e.fn == plan::AggFn::Count) col.push_int(count);
+        else col.push_double(sum, count > 0);  // SUM over no rows is NULL
+    }
 }
 
 }  // namespace
@@ -74,7 +82,7 @@ PreparedQuery prepare(const plan::Node& root, const CompileOptions& options) {
     plan::validate_query(root);
     PreparedQuery query;
     query.root    = &root;
-    query.grouped = std::get<plan::SumCount>(root.op).group_col.has_value();
+    query.grouped = std::get<plan::Aggregate>(root.op).group_col.has_value();
 
     const auto        start  = Clock::now();
     query.scans              = bind_scans(root);
@@ -90,12 +98,15 @@ plan::QueryResult execute(const PreparedQuery& query) {
     BoundInput bound;
     bind_inputs(query.scans, bound);
 
-    plan::QueryResult  result;
+    const auto&       agg = std::get<plan::Aggregate>(query.root->op);
+    plan::QueryResult result;
     result.grouped = query.grouped;
     if (result.grouped) result.columns.push_back({DataType::Int64, {}, {}, {}});
-    result.columns.push_back({DataType::Float64, {}, {}, {}});
-    result.columns.push_back({DataType::Int64, {}, {}, {}});
-    wb_rt::QueryOutput out{&result, collect_group};
+    const auto types = plan::output_types(*query.root);
+    for (std::size_t i = result.grouped ? 1 : 0; i < types.size(); ++i)
+        result.columns.push_back({types[i], {}, {}, {}});
+    Collector          collector{&result, &agg};
+    wb_rt::QueryOutput out{&collector, collect_group};
     const int          rc = query.compiled.fn(&bound.input, &out);
     if (rc == 1) throw CodegenError("codegen: a segment's width signature was not compiled (stale library?)");
     if (rc != 0) throw CodegenError("codegen: wb_query failed with code " + std::to_string(rc));

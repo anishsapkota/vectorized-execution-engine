@@ -45,14 +45,14 @@ const char* op_symbol(CompareOp op) {
     return "?";
 }
 
-bool contains_sum_count(const Node& node) {
+bool contains_aggregate(const Node& node) {
     return std::visit(Overloaded{
                           [](const Scan&) { return false; },
-                          [](const Filter& f) { return contains_sum_count(*f.child); },
+                          [](const Filter& f) { return contains_aggregate(*f.child); },
                           [](const HashJoin& j) {
-                              return contains_sum_count(*j.probe) || contains_sum_count(*j.build);
+                              return contains_aggregate(*j.probe) || contains_aggregate(*j.build);
                           },
-                          [](const SumCount&) { return true; },
+                          [](const Aggregate&) { return true; },
                       },
                       node.op);
 }
@@ -71,8 +71,30 @@ NodePtr join(NodePtr probe, NodePtr build, std::size_t probe_key, std::size_t bu
     return std::make_unique<Node>(Node{HashJoin{std::move(probe), std::move(build), probe_key, build_key}});
 }
 
+NodePtr aggregate(NodePtr child, std::optional<std::size_t> group_col, std::vector<AggExpr> aggs) {
+    return std::make_unique<Node>(Node{Aggregate{std::move(child), group_col, std::move(aggs)}});
+}
+
 NodePtr sum_count(NodePtr child, std::optional<std::size_t> group_col, std::size_t sum_col) {
-    return std::make_unique<Node>(Node{SumCount{std::move(child), group_col, sum_col}});
+    return aggregate(std::move(child), group_col, {{AggFn::Sum, sum_col}, {AggFn::Count, std::nullopt}});
+}
+
+const char* agg_fn_name(AggFn fn) {
+    switch (fn) {
+        case AggFn::Count:
+            return "count";
+        case AggFn::Sum:
+            return "sum";
+        case AggFn::Min:
+            return "min";
+        case AggFn::Max:
+            return "max";
+        case AggFn::Avg:
+            return "avg";
+        case AggFn::Median:
+            return "median";
+    }
+    return "?";
 }
 
 std::vector<DataType> output_types(const Node& node) {
@@ -118,20 +140,28 @@ std::vector<DataType> output_types(const Node& node) {
                 probe.insert(probe.end(), build.begin(), build.end());
                 return probe;
             },
-            [](const SumCount& a) {
+            [](const Aggregate& a) {
                 const auto            input = output_types(*a.child);
                 std::vector<DataType> types;
                 if (a.group_col) {
-                    if (column_type(input, *a.group_col, "SumCount", "group") != DataType::Int64) {
-                        reject("SumCount", "group column must be int64");
+                    if (column_type(input, *a.group_col, "Aggregate", "group") != DataType::Int64) {
+                        reject("Aggregate", "group column must be int64");
                     }
                     types.push_back(DataType::Int64);
                 }
-                if (column_type(input, a.sum_col, "SumCount", "sum") != DataType::Float64) {
-                    reject("SumCount", "sum column must be float64");
+                if (a.aggs.empty()) reject("Aggregate", "needs at least one aggregate");
+                for (const AggExpr& e : a.aggs) {
+                    const std::string name = agg_fn_name(e.fn);
+                    if (e.fn == AggFn::Count) {
+                        if (e.col) reject("Aggregate", "count takes no column (COUNT(*))");
+                        types.push_back(DataType::Int64);
+                        continue;
+                    }
+                    if (!e.col) reject("Aggregate", name + " needs a column");
+                    const DataType in = column_type(input, *e.col, "Aggregate", name.c_str());
+                    const bool to_double = e.fn == AggFn::Avg || e.fn == AggFn::Median;
+                    types.push_back(to_double ? DataType::Float64 : in);
                 }
-                types.push_back(DataType::Float64);
-                types.push_back(DataType::Int64);
                 return types;
             },
         },
@@ -139,9 +169,9 @@ std::vector<DataType> output_types(const Node& node) {
 }
 
 void validate_query(const Node& root) {
-    const auto* agg = std::get_if<SumCount>(&root.op);
-    if (!agg) reject("query", "root must be SumCount");
-    if (contains_sum_count(*agg->child)) reject("query", "SumCount is only allowed at the root");
+    const auto* agg = std::get_if<Aggregate>(&root.op);
+    if (!agg) reject("query", "root must be Aggregate");
+    if (contains_aggregate(*agg->child)) reject("query", "Aggregate is only allowed at the root");
     output_types(root);
 }
 
@@ -172,9 +202,14 @@ std::string to_string(const Node& node) {
                 return "HashJoin(" + std::to_string(j.probe_key) + "=" + std::to_string(j.build_key) +
                        ", " + to_string(*j.probe) + ", " + to_string(*j.build) + ")";
             },
-            [](const SumCount& a) {
-                return "SumCount(group=" + (a.group_col ? std::to_string(*a.group_col) : std::string{"none"}) +
-                       ",sum=" + std::to_string(a.sum_col) + ", " + to_string(*a.child) + ")";
+            [](const Aggregate& a) {
+                std::string out = "Aggregate(group=" +
+                                  (a.group_col ? std::to_string(*a.group_col) : std::string{"none"}) + ",[";
+                for (std::size_t i = 0; i < a.aggs.size(); ++i) {
+                    out += (i ? "," : "") + std::string{agg_fn_name(a.aggs[i].fn)};
+                    if (a.aggs[i].col) out += "(" + std::to_string(*a.aggs[i].col) + ")";
+                }
+                return out + "], " + to_string(*a.child) + ")";
             },
         },
         node.op);
