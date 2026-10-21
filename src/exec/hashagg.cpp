@@ -95,7 +95,7 @@ void HashAggOperator::consume_(const Batch& batch) {
 
 template <typename Rows>
 void HashAggOperator::consume_rows_(const Batch& batch, const Rows& rows) {
-    gids_.resize(rows.size());
+    if (group_col_) gids_.resize(rows.size());
 
     // Pass 1: group ids and counts (a global aggregate is group 0).
     if (group_col_) {
@@ -107,9 +107,10 @@ void HashAggOperator::consume_rows_(const Batch& batch, const Rows& rows) {
         });
     } else {
         if (counts_.empty() && rows.size() > 0) add_group_(batch, rows[0]);
-        std::fill(gids_.begin(), gids_.end(), 0u);
         if (rows.size() > 0) counts_[0] += static_cast<int64_t>(rows.size());
     }
+
+    if (!group_col_) return consume_global_(batch, rows);
 
     // Pass 2: one loop per aggregate; kind and type are resolved before the row loop.
     for (State& s : states_) {
@@ -134,6 +135,53 @@ void HashAggOperator::consume_rows_(const Batch& batch, const Rows& rows) {
                 break;
             case AggKind::Median:
                 s.med_gids.insert(s.med_gids.end(), gids.begin(), gids.end());
+                if (is_int) for_each_int(col, rows, [&](std::size_t, int64_t v) { s.med_i64.push_back(v); });
+                else for_each_double(col, rows, [&](std::size_t, double v) { s.med_f64.push_back(v); });
+                break;
+            case AggKind::Count:
+                break;
+        }
+    }
+}
+
+// Global aggregate: no group ids needed. Each aggregate accumulates in a local for the batch (a
+// register, not a memory read-modify-write per row), in row order like the grouped path.
+template <typename Rows>
+void HashAggOperator::consume_global_(const Batch& batch, const Rows& rows) {
+    for (State& s : states_) {
+        const AggSpec& spec = s.spec;
+        if (spec.kind == AggKind::Count || rows.size() == 0) continue;
+        const Vector& col    = batch.column(spec.col);
+        const bool    is_int = spec.type == DataType::Int64;
+        switch (spec.kind) {
+            case AggKind::Sum:
+            case AggKind::Avg:
+                if (is_int) {
+                    __int128 acc = s.i128[0];
+                    for_each_int(col, rows, [&](std::size_t, int64_t v) { acc += v; });
+                    s.i128[0] = acc;
+                } else {
+                    double acc = s.f64[0];
+                    for_each_double(col, rows, [&](std::size_t, double v) { acc += v; });
+                    s.f64[0] = acc;
+                }
+                break;
+            case AggKind::Min:
+            case AggKind::Max: {
+                const bool is_min = spec.kind == AggKind::Min;
+                if (is_int) {
+                    int64_t m = s.i64[0];
+                    for_each_int(col, rows, [&](std::size_t, int64_t v) { is_min ? update_min(m, v) : update_max(m, v); });
+                    s.i64[0] = m;
+                } else {
+                    double m = s.f64[0];
+                    for_each_double(col, rows, [&](std::size_t, double v) { is_min ? update_min(m, v) : update_max(m, v); });
+                    s.f64[0] = m;
+                }
+                break;
+            }
+            case AggKind::Median:
+                s.med_gids.resize(s.med_gids.size() + rows.size(), 0u);
                 if (is_int) for_each_int(col, rows, [&](std::size_t, int64_t v) { s.med_i64.push_back(v); });
                 else for_each_double(col, rows, [&](std::size_t, double v) { s.med_f64.push_back(v); });
                 break;

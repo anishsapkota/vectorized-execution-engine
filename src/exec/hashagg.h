@@ -49,6 +49,8 @@ class HashAggOperator final : public Operator {
     void consume_(const Batch& batch);
     template <typename Rows>
     void consume_rows_(const Batch& batch, const Rows& rows);
+    template <typename Rows>
+    void consume_global_(const Batch& batch, const Rows& rows);
     void add_group_(const Batch& batch, std::uint32_t row);
     void make_output_();
     std::vector<double> medians_(State& s) const;

@@ -211,3 +211,53 @@ Same columns and rules as the codegen spec section 8. Results are appended to th
   and stated in the results; an approximate median is a non-goal.
 - Changing global SUM on empty input from `0.0` to NULL changes existing results; the affected
   tests are updated deliberately.
+
+## 10. Results (2026-10-21)
+
+Setup:
+
+- Apple M3 Pro, single-threaded, best of 7 runs.
+- Data: readings 10M rows; orders 2M rows; customers 100k rows.
+- Raw output: `bench/results/codegen.txt`.
+- All 27 rows (9 queries × 3 engines) matched bit for bit.
+
+| Query | vec ms | cg-O3 ms | speedup | Prediction | Verdict |
+|---|---|---|---|---|---|
+| Q6 min/max/avg/count by device | 38.1 | 32.5 | 1.17× | codegen wins | **confirmed**, modestly |
+| Q7 median by device | 149.3 | 136.4 | 1.10× | ≈ equal | **confirmed** |
+| Q8 global median, ts > mid | 67.3 | 64.1 | 1.05× | ≈ equal | **confirmed** |
+| Q9 join + avg/median by region | 33.7 | 23.1 | 1.46× | codegen wins | **confirmed** |
+
+**Q6.** The vectorized engine makes four passes per batch over (gid, value): one per
+aggregate after the gid pass. The generated loop updates one `Row` per tuple. The gain is
+smaller than the join's (Q5/Q9) because both engines pay the same group-table probe per row,
+which dominates.
+
+**Q7 and Q8.** Most of the time is MEDIAN-specific. Q7 takes about 136–149 ms against about
+26 ms for a grouped SUM/COUNT over the same rows (Q4), so roughly 80% goes to collecting values
+and the finalize step (inferred from that difference, not profiled). That
+step is a counting sort plus a per-group selection, with the same complexity in both engines
+(`std::nth_element` in one, the runtime's three-way quickselect in the other), so the execution
+model barely matters.
+
+MEDIAN memory, computed for 10M rows:
+
+- 4 B gid plus 8 B value collected per input row;
+- plus 8 B per row for the bucketed copy at finalize;
+- about 20 B per row at peak, roughly 200 MB transient for Q7.
+
+**Q9.** The same cause as Q5: the vectorized join materializes every output row into chunks
+(31k allocations per run, against 72) before the aggregate sees it.
+
+**Effect on the earlier queries** (codegen spec §11):
+
+- **Q1–Q3:** unchanged. The first cut of the generalized operator ran global aggregates through
+  per-row group-id arrays and was 2× slower (Q1 vec 12.7 ms). Global aggregates now accumulate
+  in a local per batch, as the old drain loop did.
+- **Q4:** now about 25–27 ms in **both** engines, against about 17.7 ms before. Both replaced a
+  key → {sum, count} table with dense group ids plus separate per-group state: one more
+  dependent memory access per row. Q4 is still a tie (cg-O3 1.05×).
+- **`wb_bench` "groupby device 1T":** 16.9 → about 25.7 ms, for the same reason. Per-group
+  sums are bit-identical to the old path (test `vec_group_sums_match_agg_hash_table`). The
+  printed total over all groups changed in the last digits because groups are now emitted in
+  first-seen order.

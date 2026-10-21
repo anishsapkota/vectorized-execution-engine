@@ -143,6 +143,14 @@ int main(int argc, char** argv) {
         const auto q4 = sum_count(scan(readings, {0, 2}), 0, 1);
         const auto q5 = sum_count(
             join(filter(scan(*orders, {0, 1}), {{1, CompareOp::Gt, 50.0}}), scan(*customers, {0, 1}), 0, 0), 3, 1);
+        const auto q6 = aggregate(scan(readings, {0, 2}), 0,
+                                  {{AggFn::Min, 1}, {AggFn::Max, 1}, {AggFn::Avg, 1}, {AggFn::Count, std::nullopt}});
+        const auto q7 = aggregate(scan(readings, {0, 2}), 0, {{AggFn::Median, 1}});
+        const auto q8 = aggregate(filter(scan(readings, {1, 2}), {{0, CompareOp::Gt, mid}}), std::nullopt,
+                                  {{AggFn::Median, 1}});
+        const auto q9 = aggregate(
+            join(filter(scan(*orders, {0, 1}), {{1, CompareOp::Gt, 50.0}}), scan(*customers, {0, 1}), 0, 0), 3,
+            {{AggFn::Avg, 1}, {AggFn::Median, 1}});
 
         std::size_t rows = 0;
         for (const auto& seg : readings.segments())
@@ -150,8 +158,10 @@ int main(int argc, char** argv) {
         std::printf("readings %zu rows (%zu segments), orders %lld, customers %lld, iters %d, single-threaded\n", rows,
                     readings.num_segments(), static_cast<long long>(o.orders), static_cast<long long>(o.customers),
                     o.iters);
-        std::printf("Q1 %s\nQ2 %s\nQ3 %s\nQ4 %s\nQ5 %s\n\n", to_string(*q1).c_str(), to_string(*q2).c_str(),
-                    to_string(*q3).c_str(), to_string(*q4).c_str(), to_string(*q5).c_str());
+        int n = 0;
+        for (const auto* q : {&q1, &q2, &q3, &q4, &q5, &q6, &q7, &q8, &q9})
+            std::printf("Q%d %s\n", ++n, to_string(**q).c_str());
+        std::printf("\n");
         std::printf("%-3s %-7s %8s %10s %8s %10s %10s %8s %10s %9s %5s\n", "q", "engine", "gen ms", "compile ms",
                     "load ms", "best ms", "median ms", "speedup", "break-even", "allocs", "match");
 
@@ -160,6 +170,10 @@ int main(int argc, char** argv) {
         bench_query("Q3", *q3, o.iters);
         bench_query("Q4", *q4, o.iters);
         bench_query("Q5", *q5, o.iters);
+        bench_query("Q6", *q6, o.iters);
+        bench_query("Q7", *q7, o.iters);
+        bench_query("Q8", *q8, o.iters);
+        bench_query("Q9", *q9, o.iters);
 
         if (!g_all_match) {
             std::fprintf(stderr, "error: compiled and vectorized results differ\n");
