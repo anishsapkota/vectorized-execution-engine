@@ -20,7 +20,9 @@ namespace wb {
 // that aggregate's state array. Semantics (shared with the compiled engine):
 //   SUM starts at +0.0 / 0 and every row adds; SUM(INT64) accumulates in __int128 and throws
 //   std::overflow_error at output if the result leaves int64. MIN/MAX start at the group's first
-//   value and update with `v < m || v != v` (NaN wins).
+//   value and update with `v < m || v != v` (NaN wins). MEDIAN is exact: values are collected,
+//   bucketed by group with a counting sort, and selected with std::nth_element (NaN sorts last);
+//   an even count averages the two middle values.
 class HashAggOperator final : public Operator {
    public:
     HashAggOperator(std::unique_ptr<Operator> child, std::optional<std::size_t> group_col,
@@ -37,6 +39,10 @@ class HashAggOperator final : public Operator {
         std::vector<double>   f64;   // Sum/Avg FLOAT64, Min/Max FLOAT64
         std::vector<__int128> i128;  // Sum/Avg INT64
         std::vector<int64_t>  i64;   // Min/Max INT64
+        // Median: every (group id, value) pair, in arrival order.
+        std::vector<std::uint32_t> med_gids;
+        std::vector<int64_t>       med_i64;
+        std::vector<double>        med_f64;
     };
 
     void build_();
@@ -45,6 +51,7 @@ class HashAggOperator final : public Operator {
     void consume_rows_(const Batch& batch, const Rows& rows);
     void add_group_(const Batch& batch, std::uint32_t row);
     void make_output_();
+    std::vector<double> medians_(State& s) const;
 
     std::unique_ptr<Operator>  child_;
     std::optional<std::size_t> group_col_;

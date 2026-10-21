@@ -555,3 +555,45 @@ TEST(vec_group_sums_match_agg_hash_table) {
         CHECK_EQ(got.int_at(2, row), w.count);
     }
 }
+
+TEST(vec_median_odd_even_single) {
+    auto d = make_kv_double(median_double_rows(), 5);
+    auto i = make_table("t", median_int_rows(), 5);
+    check_matches_reference(*aggregate(scan(*d, {0, 1}), 0, {{AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+    check_matches_reference(*aggregate(scan(*i, {0, 1}), 0, {{AggFn::Median, 1}}));
+}
+
+TEST(vec_median_int64_extremes) {
+    auto       t = make_table("t", int64_extreme_rows());
+    const auto q = aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}});
+    check_matches_reference(*q);
+    CHECK_EQ(run_vectorized(*q).double_at(1, 0),
+             (static_cast<double>(INT64_MIN) + static_cast<double>(INT64_MAX)) / 2.0);
+}
+
+TEST(vec_median_nan_middle) {
+    auto       t = make_kv_double(nan_median_rows());
+    const auto q = aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}});
+    check_matches_reference(*q);
+    const auto r = run_vectorized(*q);
+    CHECK(std::isnan(r.double_at(1, 0)));
+    CHECK_EQ(r.double_at(1, 1), 2.0);
+}
+
+TEST(vec_median_grouped_and_global_readings) {
+    auto t        = make_readings(50'000);
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (const auto& seg : t->segments()) {
+        lo = std::min(lo, seg->zone(1).min_i64());
+        hi = std::max(hi, seg->zone(1).max_i64());
+    }
+    check_matches_reference(*aggregate(scan(*t, {0, 2}), 0, {{AggFn::Median, 1}}));
+    check_matches_reference(
+        *aggregate(filter(scan(*t, {1, 2}), {{0, CompareOp::Gt, lo + (hi - lo) / 2}}), std::nullopt, {{AggFn::Median, 1}}));
+}
+
+TEST(vec_group_column_aggregated) {
+    auto t = make_readings(20'000);
+    check_matches_reference(*aggregate(scan(*t, {0, 2}), 0,
+                                       {{AggFn::Min, 0}, {AggFn::Max, 0}, {AggFn::Median, 0}, {AggFn::Count, std::nullopt}}));
+}

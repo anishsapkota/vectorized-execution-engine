@@ -1,6 +1,8 @@
 #include "exec/hashagg.h"
 
 #include <algorithm>
+#include <cmath>
+#include <functional>
 #include <stdexcept>
 #include <span>
 #include <string>
@@ -61,8 +63,7 @@ HashAggOperator::HashAggOperator(std::unique_ptr<Operator> child, std::optional<
     : child_(std::move(child)),
       group_col_(group_col) {
     for (const AggSpec& spec : aggs) {
-        if (spec.kind == AggKind::Median) throw std::invalid_argument("aggregate median not supported yet");
-        states_.push_back(State{spec, {}, {}, {}});
+        states_.push_back(State{spec, {}, {}, {}, {}, {}, {}});
     }
 }
 
@@ -131,11 +132,60 @@ void HashAggOperator::consume_rows_(const Batch& batch, const Rows& rows) {
                 if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { update_max(s.i64[gids[k]], v); });
                 else for_each_double(col, rows, [&](std::size_t k, double v) { update_max(s.f64[gids[k]], v); });
                 break;
-            case AggKind::Count:
             case AggKind::Median:
+                s.med_gids.insert(s.med_gids.end(), gids.begin(), gids.end());
+                if (is_int) for_each_int(col, rows, [&](std::size_t, int64_t v) { s.med_i64.push_back(v); });
+                else for_each_double(col, rows, [&](std::size_t, double v) { s.med_f64.push_back(v); });
+                break;
+            case AggKind::Count:
                 break;
         }
     }
+}
+
+namespace {
+
+bool less_nan_last(double a, double b) { return !std::isnan(a) && (std::isnan(b) || a < b); }
+
+// Median of values[begin, end) (non-empty); reorders the range.
+template <typename T, typename Less>
+double median_of(T* begin, T* end, Less less) {
+    const std::size_t n   = static_cast<std::size_t>(end - begin);
+    T*                mid = begin + n / 2;
+    std::nth_element(begin, mid, end, less);
+    if (n % 2) return static_cast<double>(*mid);
+    const T lo = *std::max_element(begin, mid, less);  // everything left of mid is <= *mid
+    return (static_cast<double>(lo) + static_cast<double>(*mid)) / 2.0;
+}
+
+template <typename T, typename Less>
+std::vector<double> group_medians(const std::vector<std::uint32_t>& gids, const std::vector<T>& values,
+                                  const std::vector<int64_t>& counts, Less less) {
+    // Counting sort by group: every row of a group contributed exactly one value.
+    std::vector<std::size_t> start(counts.size() + 1, 0);
+    for (std::size_t g = 0; g < counts.size(); ++g)
+        start[g + 1] = start[g] + static_cast<std::size_t>(counts[g]);
+    std::vector<T>           bucketed(values.size());
+    std::vector<std::size_t> next(start.begin(), start.end() - 1);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        bucketed[next[gids[i]]++] = values[i];
+
+    std::vector<double> out(counts.size());
+    for (std::size_t g = 0; g < counts.size(); ++g)
+        out[g] = median_of(bucketed.data() + start[g], bucketed.data() + start[g + 1], less);
+    return out;
+}
+
+}  // namespace
+
+std::vector<double> HashAggOperator::medians_(State& s) const {
+    std::vector<double> out = s.spec.type == DataType::Int64
+                                  ? group_medians(s.med_gids, s.med_i64, counts_, std::less<int64_t>{})
+                                  : group_medians(s.med_gids, s.med_f64, counts_, less_nan_last);
+    s.med_gids = {};
+    s.med_i64  = {};
+    s.med_f64  = {};
+    return out;
 }
 
 void HashAggOperator::make_output_() {
@@ -146,7 +196,7 @@ void HashAggOperator::make_output_() {
             keys[g] = index_.key_of(g);
         out_vecs_.push_back(std::make_unique<Int64Vector>(keys));
     }
-    for (const State& s : states_) {
+    for (State& s : states_) {
         const AggSpec& spec   = s.spec;
         const bool     is_int = spec.type == DataType::Int64;
         switch (spec.kind) {
@@ -184,7 +234,8 @@ void HashAggOperator::make_output_() {
                 else out_vecs_.push_back(std::make_unique<Float64Vector>(s.f64));
                 break;
             case AggKind::Median:
-                break;  // rejected in the constructor
+                out_vecs_.push_back(std::make_unique<Float64Vector>(medians_(s)));
+                break;
         }
     }
     for (const auto& v : out_vecs_)

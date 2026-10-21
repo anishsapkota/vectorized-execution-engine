@@ -146,4 +146,33 @@ inline KeyValueRows int128_intermediate_rows() {
 
 // Group 42 whose sum overflows int64.
 inline KeyValueRows overflow_rows() { return {{42, INT64_MAX}, {42, 1}}; }
+
+// Groups 1-4 with 1, 2, 7 and 10 values (odd, even, single), deterministic pseudo-random values.
+inline std::vector<std::pair<int64_t, double>> median_double_rows() {
+    std::vector<std::pair<int64_t, double>> rows;
+    uint64_t state = 99;
+    const int sizes[] = {1, 2, 7, 10};
+    for (int g = 0; g < 4; ++g) {
+        for (int i = 0; i < sizes[g]; ++i) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            rows.emplace_back(g + 1, static_cast<double>(state >> 40) / 1024.0 - 4096.0);
+        }
+    }
+    return rows;
+}
+
+inline KeyValueRows median_int_rows() {
+    KeyValueRows rows;
+    for (const auto& [k, v] : median_double_rows())
+        rows.emplace_back(k, static_cast<int64_t>(v * 1000));
+    return rows;
+}
+
+// Group 1: even count with NaN in the middle pair -> NaN. Group 2: odd count, NaN sorts last -> 2.0.
+inline std::vector<std::pair<int64_t, double>> nan_median_rows() {
+    return {{1, 1.0}, {1, kNaN}, {1, 3.0}, {1, kNaN}, {2, 1.0}, {2, 2.0}, {2, kNaN}};
+}
+
+inline KeyValueRows int64_extreme_rows() { return {{1, INT64_MIN}, {1, INT64_MAX}}; }
+
 }  // namespace wbtest
