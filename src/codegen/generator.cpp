@@ -149,9 +149,7 @@ class Generator {
         if (const auto* f = std::get_if<plan::Filter>(&node.op)) {
             return produce(*f->child, [&, f](Ctx& ctx) { consume_filter(*f, ctx, consume); });
         }
-        if (std::holds_alternative<plan::HashJoin>(node.op)) {
-            throw CodegenError("codegen: HashJoin not supported yet");
-        }
+        if (const auto* j = std::get_if<plan::HashJoin>(&node.op)) return produce_join(*j, consume);
         throw CodegenError("codegen: SumCount is only supported at the root");
     }
 
@@ -189,6 +187,56 @@ class Generator {
         }
         consume(ctx);
         current_ = previous;
+    }
+
+    // Build pipeline(s) fill join table J; the build pipeline's completion finalizes it. Then the
+    // probe side produces, and each probe tuple loops over its matches.
+    void produce_join(const plan::HashJoin& j, const Consumer& consume) {
+        const std::size_t id         = join_cols_.size();
+        const auto        build_cols = plan::output_types(*j.build);
+        join_cols_.push_back(build_cols.size());
+
+        produce(*j.build, [&, id](Ctx& ctx) { consume_build(j, id, ctx); });
+        produce(*j.probe, [&, id](Ctx& ctx) { consume_probe(j, id, build_cols, ctx, consume); });
+    }
+
+    void consume_build(const plan::HashJoin& j, std::size_t id, Ctx& ctx) {
+        const std::string jt = "st.jt" + std::to_string(id);
+        std::string       payload;
+        for (std::size_t c = 0; c < ctx.size(); ++c) {
+            const std::string v = ctx[c].get();
+            payload += std::string{c ? ", " : ""} +
+                       (ctx[c].is_int ? "static_cast<uint64_t>(" + v + ")" : "__builtin_bit_cast(uint64_t, " + v + ")");
+        }
+        const std::string key = ctx[j.build_key].get();
+        cur().body.open("{");
+        cur().body.line("const uint64_t payload[] = {" + payload + "};");
+        cur().body.line(jt + ".append(" + key + ", payload);");
+        cur().body.close();
+        if (finalized_.size() <= id) finalized_.resize(id + 1, false);
+        if (!finalized_[id]) {
+            finalized_[id] = true;
+            cur().after_run.push_back("if (rc == 0) " + jt + ".finalize();");
+        }
+    }
+
+    void consume_probe(const plan::HashJoin& j, std::size_t id, const std::vector<DataType>& build_cols, Ctx& probe,
+                       const Consumer& consume) {
+        const std::string jt     = "st.jt" + std::to_string(id);
+        const std::string bucket = fresh("jb");
+        const std::string row    = fresh("j");
+        cur().body.line("const wb_rt::JoinBucket* " + bucket + " = " + jt + ".find(" + probe[j.probe_key].get() + ");");
+        cur().body.line("if (" + bucket + " == nullptr) continue;");
+        cur().body.open("for (uint32_t " + row + " = " + bucket + "->first; " + row + " < " + bucket + "->first + " +
+                        bucket + "->count; ++" + row + ") {");
+        Ctx out = probe;
+        for (std::size_t c = 0; c < build_cols.size(); ++c) {
+            const std::string raw = jt + ".col(" + std::to_string(c) + "u, " + row + ")";
+            out.push_back(build_cols[c] == DataType::Int64 ? lazy(true, "static_cast<int64_t>(" + raw + ")")
+                                                           : lazy(false, "__builtin_bit_cast(double, " + raw + ")"));
+        }
+        consume(out);
+        cur().body.close();
     }
 
     // A column whose load is emitted at first use, into whatever scope is current then.
@@ -250,6 +298,8 @@ class Generator {
         w.line("double sum = 0.0;");
         w.line("int64_t count = 0;");
         w.line("wb_rt::AggTable agg;");
+        for (std::size_t id = 0; id < join_cols_.size(); ++id)
+            w.line("wb_rt::JoinTable jt" + std::to_string(id) + ";");
         w.close("};");
 
         for (const auto& pipeline : pipelines_)
@@ -263,6 +313,8 @@ class Generator {
         w.line("if (in->num_scans != " + std::to_string(scans_.size()) + "u) return 2;");
         w.line("State st;");
         if (grouped_) w.line("st.agg.init();");
+        for (std::size_t id = 0; id < join_cols_.size(); ++id)
+            w.line("st.jt" + std::to_string(id) + ".init(" + std::to_string(join_cols_[id]) + "u);");
         w.line("int rc = 0;");
         for (const auto& pipeline : pipelines_) {
             const std::string k = std::to_string(pipeline->scan_index);
@@ -278,6 +330,8 @@ class Generator {
         }
         w.close();
         if (grouped_) w.line("st.agg.release();");
+        for (std::size_t id = 0; id < join_cols_.size(); ++id)
+            w.line("st.jt" + std::to_string(id) + ".release();");
         w.line("return rc;");
         w.close();
         return w.str();
@@ -335,6 +389,8 @@ class Generator {
     std::size_t                             next_scan_ = 0;
     std::size_t                             counter_   = 0;
     bool                                    grouped_   = false;
+    std::vector<std::size_t>                join_cols_;  // payload columns per join table
+    std::vector<bool>                       finalized_;  // finalize() already scheduled
 };
 
 }  // namespace
