@@ -134,7 +134,7 @@ class Generator {
     std::string run() {
         const auto& agg = std::get<plan::Aggregate>(root_.op);
         grouped_        = agg.group_col.has_value();
-        sum_col_        = supported_sum_col(agg);
+        plan_fields(agg);
         produce(*agg.child, [&](Ctx& ctx) { consume_aggregate(agg, ctx); });
         if (next_scan_ != scans_.size()) throw CodegenError("codegen: scan bindings do not match the plan");
         return assemble();
@@ -263,46 +263,140 @@ class Generator {
         consume(ctx);
     }
 
-    // Until the generator is generalized: at least one Sum, all on one Float64 column, plus Counts.
-    static std::size_t supported_sum_col(const plan::Aggregate& agg) {
-        const auto                 types = plan::output_types(*agg.child);
-        std::optional<std::size_t> col;
-        for (const plan::AggExpr& e : agg.aggs) {
-            if (e.fn == plan::AggFn::Count) continue;
-            if (e.fn != plan::AggFn::Sum || types[*e.col] != DataType::Float64 || (col && *col != *e.col)) {
-                throw CodegenError(std::string{"codegen: aggregate "} + plan::agg_fn_name(e.fn) + " not supported yet");
+    // One state field per aggregate except COUNT (which reads Row::count).
+    struct Field {
+        plan::AggFn fn;
+        bool        is_int;  // input column is Int64
+        std::size_t col;
+        std::string name;
+    };
+
+    void plan_fields(const plan::Aggregate& agg) {
+        const auto in = plan::output_types(*agg.child);
+        for (std::size_t i = 0; i < agg.aggs.size(); ++i) {
+            const plan::AggExpr& e = agg.aggs[i];
+            if (e.fn == plan::AggFn::Median) throw CodegenError("codegen: aggregate median not supported yet");
+            if (e.fn == plan::AggFn::Count) {
+                fields_.push_back({e.fn, true, 0, ""});
+                continue;
             }
-            col = e.col;
+            const bool sum_like = e.fn == plan::AggFn::Sum || e.fn == plan::AggFn::Avg;
+            fields_.push_back({e.fn, in[*e.col] == DataType::Int64, *e.col, (sum_like ? "s" : "m") + std::to_string(i)});
         }
-        if (!col) throw CodegenError("codegen: aggregate count not supported yet");
-        return *col;
+    }
+
+    static std::string field_type(const Field& f) {
+        const bool sum_like = f.fn == plan::AggFn::Sum || f.fn == plan::AggFn::Avg;
+        if (f.is_int) return sum_like ? "__int128" : "int64_t";
+        return "double";
+    }
+
+    // Per-tuple update of Row `r` (a group's record, or the global accumulator).
+    void emit_updates(const std::string& r, const std::vector<std::string>& vals) {
+        cur().body.line("++" + r + ".count;");
+        for (std::size_t i = 0; i < fields_.size(); ++i) {
+            const Field& f = fields_[i];
+            const std::string& v = vals[i];
+            const std::string  m = r + "." + f.name;
+            switch (f.fn) {
+                case plan::AggFn::Sum:
+                case plan::AggFn::Avg:
+                    cur().body.line(m + " += " + v + ";");
+                    break;
+                case plan::AggFn::Min:
+                    cur().body.line("if (" + v + " < " + m + " || " + v + " != " + v + ") " + m + " = " + v + ";");
+                    break;
+                case plan::AggFn::Max:
+                    cur().body.line("if (" + v + " > " + m + " || " + v + " != " + v + ") " + m + " = " + v + ";");
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     void consume_aggregate(const plan::Aggregate& agg, Ctx& ctx) {
+        // Load every needed value before opening a scope (lazy loads must stay in row scope).
+        std::vector<std::string> vals(fields_.size());
+        for (std::size_t i = 0; i < fields_.size(); ++i)
+            if (fields_[i].fn != plan::AggFn::Count) vals[i] = ctx[fields_[i].col].get();
+
         if (agg.group_col) {
             const std::string key = ctx[*agg.group_col].get();
-            const std::string val = ctx[sum_col_].get();
+            std::string       init = "Row{0";  // new group: count 0, sums 0, MIN/MAX at this row's value
+            for (std::size_t i = 0; i < fields_.size(); ++i) {
+                const Field& f = fields_[i];
+                if (f.fn == plan::AggFn::Count) continue;
+                init += (f.fn == plan::AggFn::Sum || f.fn == plan::AggFn::Avg) ? ", 0" : ", " + vals[i];
+            }
+            init += "}";
             cur().body.open("{");
             cur().body.line("const uint32_t g = st.groups.find_or_insert(" + key + ");");
-            cur().body.line("if (g == st.rows.size) st.rows.push(Row{0, 0.0});");
+            cur().body.line("if (g == st.rows.size) st.rows.push(" + init + ");");
             cur().body.line("Row& e = st.rows.data[g];");
-            cur().body.line("e.sum += " + val + ";");
-            cur().body.line("++e.count;");
+            emit_updates("e", vals);
             cur().body.close();
             return;
         }
-        // Accumulate in locals (registers) for the segment, continuing from st so the summation
-        // order is exactly the vectorized engine's.
+        // Global: one Row accumulated in a local for the segment, continuing from st.acc so the
+        // summation order is exactly the vectorized engine's.
         if (!cur().has_global_acc) {
             cur().has_global_acc = true;
-            cur().prologue.push_back("double acc_sum = st.sum;");
-            cur().prologue.push_back("int64_t acc_count = st.count;");
-            cur().epilogue.push_back("st.sum = acc_sum;");
-            cur().epilogue.push_back("st.count = acc_count;");
+            cur().prologue.push_back("Row acc = st.acc;");
+            cur().epilogue.push_back("st.acc = acc;");
         }
-        const std::string val = ctx[sum_col_].get();
-        cur().body.line("acc_sum += " + val + ";");
-        cur().body.line("++acc_count;");
+        std::string first;
+        for (std::size_t i = 0; i < fields_.size(); ++i) {
+            const Field& f = fields_[i];
+            if (f.fn == plan::AggFn::Min || f.fn == plan::AggFn::Max) first += " acc." + f.name + " = " + vals[i] + ";";
+        }
+        if (!first.empty()) cur().body.line("if (acc.count == 0) {" + first + " }");
+        emit_updates("acc", vals);
+    }
+
+    // Serializes one group's Row into an output row; returns 3 on SUM(INT64) overflow.
+    void emit_group_function(CodeWriter& w) {
+        const std::size_t n = fields_.size() + (grouped_ ? 1 : 0);
+        w.line("");
+        w.open("int emit_group(const Row& r, int64_t key, uint8_t global, wb_rt::QueryOutput* out) {");
+        w.line("uint64_t row[" + std::to_string(n) + "];");
+        std::size_t c = 0;
+        if (grouped_) w.line("row[" + std::to_string(c++) + "] = static_cast<uint64_t>(key);");
+        for (const Field& f : fields_) {
+            const std::string slot = "row[" + std::to_string(c++) + "] = ";
+            const std::string m    = "r." + f.name;
+            switch (f.fn) {
+                case plan::AggFn::Count:
+                    w.line(slot + "static_cast<uint64_t>(r.count);");
+                    break;
+                case plan::AggFn::Sum:
+                    if (f.is_int) {
+                        w.open("if (" + m + " > static_cast<__int128>(INT64_MAX) || " + m +
+                               " < static_cast<__int128>(INT64_MIN)) {");
+                        w.line("out->error_key = key;");
+                        w.line("out->error_global = global;");
+                        w.line("return 3;");
+                        w.close();
+                        w.line(slot + "static_cast<uint64_t>(static_cast<int64_t>(" + m + "));");
+                    } else {
+                        w.line(slot + "__builtin_bit_cast(uint64_t, " + m + ");");
+                    }
+                    break;
+                case plan::AggFn::Avg:
+                    w.line(slot + "__builtin_bit_cast(uint64_t, " +
+                           (f.is_int ? "static_cast<double>(" + m + ")" : m) + " / static_cast<double>(r.count));");
+                    break;
+                case plan::AggFn::Min:
+                case plan::AggFn::Max:
+                    w.line(slot + (f.is_int ? "static_cast<uint64_t>(" + m + ");" : "__builtin_bit_cast(uint64_t, " + m + ");"));
+                    break;
+                case plan::AggFn::Median:
+                    break;
+            }
+        }
+        w.line("out->emit_row(out->ctx, row, " + std::to_string(n) + "u);");
+        w.line("return 0;");
+        w.close();
     }
 
     std::string assemble() {
@@ -314,12 +408,13 @@ class Generator {
         w.line("");
         w.open("struct Row {");
         w.line("int64_t count;");
-        w.line("double sum;");
+        for (const Field& f : fields_)
+            if (f.fn != plan::AggFn::Count) w.line(field_type(f) + " " + f.name + ";");
         w.close("};");
+        emit_group_function(w);
         w.line("");
         w.open("struct State {");
-        w.line("double sum = 0.0;");
-        w.line("int64_t count = 0;");
+        w.line("Row acc{};  // global aggregate");
         w.line("wb_rt::GroupTable groups;");
         w.line("wb_rt::StateRows<Row> rows;");
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
@@ -346,18 +441,11 @@ class Generator {
             for (const auto& stmt : pipeline->after_run)
                 w.line(stmt);
         }
-        w.open("if (rc == 0) {");
         if (grouped_) {
-            w.open("for (uint32_t g = 0; g < st.rows.size; ++g) {");
-            w.line("const Row& r = st.rows.data[g];");
-            w.line("const uint64_t row[3] = {static_cast<uint64_t>(st.groups.key_of(g)), __builtin_bit_cast(uint64_t, r.sum), static_cast<uint64_t>(r.count)};");
-            w.line("out->emit_row(out->ctx, row, 3);");
-            w.close();
+            w.line("for (uint32_t g = 0; rc == 0 && g < st.rows.size; ++g) rc = emit_group(st.rows.data[g], st.groups.key_of(g), 0, out);");
         } else {
-            w.line("const uint64_t row[2] = {__builtin_bit_cast(uint64_t, st.sum), static_cast<uint64_t>(st.count)};");
-            w.line("out->emit_row(out->ctx, row, 2);");
+            w.line("if (rc == 0 && st.acc.count > 0) rc = emit_group(st.acc, 0, 1, out);  // empty: host adds the NULL row");
         }
-        w.close();
         if (grouped_) {
             w.line("st.groups.release();");
             w.line("st.rows.release();");
@@ -421,7 +509,7 @@ class Generator {
     std::size_t                             next_scan_ = 0;
     std::size_t                             counter_   = 0;
     bool                                    grouped_   = false;
-    std::size_t                             sum_col_   = 0;
+    std::vector<Field>                      fields_;  // one per aggregate, in order
     std::vector<std::size_t>                join_cols_;  // payload columns per join table
     std::vector<bool>                       finalized_;  // finalize() already scheduled
 };

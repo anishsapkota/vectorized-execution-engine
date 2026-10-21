@@ -44,6 +44,15 @@ void ResultColumn::push_double(double v, bool is_valid) {
     valid.push_back(is_valid);
 }
 
+void QueryResult::append_empty_aggregate_row(const std::vector<bool>& is_count) {
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        auto& col = columns[i];
+        if (is_count[i]) col.push_int(0);
+        else if (col.type == DataType::Int64) col.push_int(0, false);
+        else col.push_double(0.0, false);
+    }
+}
+
 void QueryResult::canonicalize() {
     if (!grouped || columns.empty()) return;
     const auto&              keys = columns[0].ints;

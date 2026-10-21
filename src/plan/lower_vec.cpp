@@ -83,12 +83,10 @@ QueryResult run_vectorized(const Node& root) {
     }
     // A global aggregate over no rows still answers one row: COUNT 0, everything else NULL.
     if (!result.grouped && result.num_rows() == 0) {
-        for (std::size_t i = 0; i < agg.aggs.size(); ++i) {
-            auto& col = result.columns[i];
-            if (agg.aggs[i].fn == AggFn::Count) col.push_int(0);
-            else if (col.type == DataType::Int64) col.push_int(0, false);
-            else col.push_double(0.0, false);
-        }
+        std::vector<bool> is_count;
+        for (const AggExpr& e : agg.aggs)
+            is_count.push_back(e.fn == AggFn::Count);
+        result.append_empty_aggregate_row(is_count);
     }
     result.canonicalize();
     return result;

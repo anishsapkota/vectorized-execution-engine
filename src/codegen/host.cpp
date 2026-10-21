@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <chrono>
+#include <stdexcept>
 
 #include "exec/predicate.h"
 #include "exec/scan.h"
@@ -61,23 +62,13 @@ void bind_inputs(const std::vector<ScanBinding>& bindings, BoundInput& bound) {
     bound.input = {bound.scans.data(), static_cast<uint32_t>(bound.scans.size())};
 }
 
-struct Collector {
-    plan::QueryResult*      result;
-    const plan::Aggregate*  agg;
-};
-
-// Rows arrive as [key,] sum, count (the generator's current SUM/COUNT state).
-void collect_row(void* ctx, const uint64_t* values, uint32_t) {
-    auto*       c     = static_cast<Collector*>(ctx);
-    std::size_t v     = 0;
-    std::size_t i     = 0;
-    if (c->result->grouped) c->result->columns[i++].push_int(static_cast<int64_t>(values[v++]));
-    const double  sum   = std::bit_cast<double>(values[v++]);
-    const int64_t count = static_cast<int64_t>(values[v]);
-    for (const plan::AggExpr& e : c->agg->aggs) {
-        auto& col = c->result->columns[i++];
-        if (e.fn == plan::AggFn::Count) col.push_int(count);
-        else col.push_double(sum, count > 0);  // SUM over no rows is NULL
+// Rows arrive as one 64-bit pattern per output column; decode by the column's type.
+void collect_row(void* ctx, const uint64_t* values, uint32_t n) {
+    auto* result = static_cast<plan::QueryResult*>(ctx);
+    for (uint32_t c = 0; c < n; ++c) {
+        auto& col = result->columns[c];
+        if (col.type == DataType::Int64) col.push_int(static_cast<int64_t>(values[c]));
+        else col.push_double(std::bit_cast<double>(values[c]));
     }
 }
 
@@ -106,15 +97,23 @@ plan::QueryResult execute(const PreparedQuery& query) {
     const auto&       agg = std::get<plan::Aggregate>(query.root->op);
     plan::QueryResult result;
     result.grouped = query.grouped;
-    if (result.grouped) result.columns.push_back({DataType::Int64, {}, {}, {}});
-    const auto types = plan::output_types(*query.root);
-    for (std::size_t i = result.grouped ? 1 : 0; i < types.size(); ++i)
-        result.columns.push_back({types[i], {}, {}, {}});
-    Collector          collector{&result, &agg};
-    wb_rt::QueryOutput out{&collector, collect_row, 0, 0};
+    for (DataType type : plan::output_types(*query.root))
+        result.columns.push_back({type, {}, {}, {}});
+    wb_rt::QueryOutput out{&result, collect_row, 0, 0};
     const int          rc = query.compiled.fn(&bound.input, &out);
+    if (rc == 3) {
+        throw std::overflow_error("SUM overflow in group " +
+                                  (out.error_global ? std::string{"global"} : std::to_string(out.error_key)));
+    }
     if (rc == 1) throw CodegenError("codegen: a segment's width signature was not compiled (stale library?)");
     if (rc != 0) throw CodegenError("codegen: wb_query failed with code " + std::to_string(rc));
+    // A global aggregate over no rows still answers one row: COUNT 0, everything else NULL.
+    if (!result.grouped && result.num_rows() == 0) {
+        std::vector<bool> is_count;
+        for (const plan::AggExpr& e : agg.aggs)
+            is_count.push_back(e.fn == plan::AggFn::Count);
+        result.append_empty_aggregate_row(is_count);
+    }
     result.canonicalize();
     return result;
 }

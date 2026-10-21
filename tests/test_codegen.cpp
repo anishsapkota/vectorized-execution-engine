@@ -13,6 +13,7 @@
 #include <string>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 #include "codegen/compiler.h"
@@ -32,7 +33,7 @@ using namespace wb::codegen;
 using namespace wb::plan;
 using wbtest::make_readings;
 using wbtest::make_join_tables;
-using wbtest::kNaN;
+using namespace wbtest;
 
 namespace {
 
@@ -441,4 +442,74 @@ TEST(cache_dir_writable_by_others_is_rejected) {
     chmod(dir.c_str(), 0700);
     CHECK(text.find("writable") != std::string::npos);
     CHECK(text.find(dir) != std::string::npos);
+}
+
+namespace {
+const std::vector<AggExpr> kDecomposableAggs{{AggFn::Count, std::nullopt}, {AggFn::Sum, 2}, {AggFn::Sum, 0},
+                                             {AggFn::Min, 2},              {AggFn::Max, 2}, {AggFn::Min, 1},
+                                             {AggFn::Max, 1},              {AggFn::Avg, 2}, {AggFn::Avg, 0}};
+
+template <typename F>
+std::string overflow_message(F&& f) {
+    try {
+        f();
+    } catch (const std::overflow_error& e) {
+        return e.what();
+    }
+    return "";
+}
+}  // namespace
+
+TEST(cg_all_decomposable_aggs) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000);
+    check_engines_agree(*aggregate(scan(*t, {0, 1, 2}), 0, kDecomposableAggs));
+    check_engines_agree(*aggregate(scan(*t, {0, 1, 2}), std::nullopt, kDecomposableAggs));
+}
+
+TEST(cg_min_max_nan_and_negative_zero) {
+    fresh_cache_dir();
+    auto t = make_nan_table();
+    check_engines_agree(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Min, 1}, {AggFn::Max, 1}, {AggFn::Sum, 1}}));
+    check_engines_agree(*aggregate(scan(*t, {0, 1}), std::nullopt, {{AggFn::Min, 1}, {AggFn::Max, 1}, {AggFn::Sum, 1}}));
+}
+
+TEST(cg_sum_int128_and_overflow) {
+    fresh_cache_dir();
+    auto ok = make_table("t", int128_intermediate_rows());
+    check_engines_agree(*aggregate(scan(*ok, {0, 1}), 0, {{AggFn::Sum, 1}, {AggFn::Avg, 1}}));
+    auto bad     = make_table("t", overflow_rows());
+    auto grouped = aggregate(scan(*bad, {0, 1}), 0, {{AggFn::Sum, 1}});
+    auto global  = aggregate(scan(*bad, {0, 1}), std::nullopt, {{AggFn::Sum, 1}});
+    CHECK(overflow_message([&] { run_compiled(*grouped); }).find("42") != std::string::npos);
+    CHECK(overflow_message([&] { run_vectorized(*grouped); }).find("42") != std::string::npos);
+    CHECK(overflow_message([&] { run_compiled(*global); }).find("global") != std::string::npos);
+    CHECK(overflow_message([&] { run_vectorized(*global); }).find("global") != std::string::npos);
+}
+
+TEST(cg_aggs_above_join) {
+    fresh_cache_dir();
+    auto t = make_join_tables(3'000, [](int64_t i) { return i % 400; }, 900, [](int64_t i) { return 200 + i % 300; });
+    check_engines_agree(*aggregate(join(scan(t->probe, {0, 1}), scan(t->build, {0, 1}), 0, 0), 3,
+                                   {{AggFn::Min, 1}, {AggFn::Max, 1}, {AggFn::Avg, 1}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(cg_global_all_pruned_is_null) {
+    fresh_cache_dir();
+    auto t        = make_readings(50'000);
+    auto [lo, hi] = ts_range(*t);
+    const auto r  = check_engines_agree(*aggregate(filter(scan(*t, {1, 2}), {{0, CompareOp::Gt, hi}}), std::nullopt,
+                                                   {{AggFn::Count, std::nullopt}, {AggFn::Sum, 1}, {AggFn::Min, 1}, {AggFn::Avg, 1}}));
+    CHECK_EQ(r.num_rows(), std::size_t{1});
+    CHECK_EQ(r.int_at(0, 0), int64_t{0});
+    CHECK(r.is_null(1, 0));
+    CHECK(r.is_null(2, 0));
+    CHECK(r.is_null(3, 0));
+}
+
+TEST(cg_count_only) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000);
+    check_engines_agree(*aggregate(scan(*t, {0}), 0, {{AggFn::Count, std::nullopt}}));
+    check_engines_agree(*aggregate(scan(*t, {0}), std::nullopt, {{AggFn::Count, std::nullopt}}));
 }

@@ -42,6 +42,10 @@ struct QueryResult {
     // First difference ("col C row R: ..."), or "" if equal. For test messages.
     std::string diff(const QueryResult& other) const;
 
+    // The single row of a global aggregate over no rows: COUNT columns 0, every other column NULL.
+    // is_count[i] says whether column i is a COUNT.
+    void append_empty_aggregate_row(const std::vector<bool>& is_count);
+
     int64_t int_at(std::size_t col, std::size_t row) const { return columns[col].ints[row]; }
     double  double_at(std::size_t col, std::size_t row) const { return columns[col].doubles[row]; }
     bool    is_null(std::size_t col, std::size_t row) const { return columns[col].valid[row] == 0; }
