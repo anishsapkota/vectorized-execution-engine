@@ -1,0 +1,56 @@
+
+== Experiment 1: one join, every strategy ==
+4 nodes x 2 slices, 2000000 orders, 100000 customers. * = planner's choice
+
+outer        inner           strategy            cross MB   local MB   xchg ms  join max  join min   out rows
+orders_key   customers_key   DS_DIST_NONE    *        0.0        0.0       0.0       9.1       6.3    2000000
+orders_key   customers_key   DS_DIST_INNER            0.0        1.5       0.3       9.1       6.2    2000000
+orders_key   customers_key   DS_DIST_OUTER            0.0       30.5       3.6       8.6       6.2    2000000
+orders_key   customers_key   DS_BCAST_INNER           4.6        1.5       0.2      15.1      10.3    2000000
+orders_key   customers_key   DS_DIST_BOTH             0.0       32.0       3.5       9.0       6.1    2000000
+orders_key   customers_even  DS_DIST_INNER   *        1.1        0.4       0.3       9.1       6.1    2000000
+orders_key   customers_even  DS_BCAST_INNER           4.6        1.5       0.2      14.4       9.9    2000000
+orders_key   customers_even  DS_DIST_BOTH             1.1       30.9       3.4       9.1       6.2    2000000
+orders_key   customers_all   DS_DIST_ALL_NONE*        0.0        0.0       0.0      13.3       8.4    2000000
+orders_even  customers_key   DS_DIST_OUTER           22.9        7.6       3.7       9.4       6.4    2000000
+orders_even  customers_key   DS_BCAST_INNER  *        4.6        1.5       0.2      16.5      12.1    2000000
+orders_even  customers_key   DS_DIST_BOTH            22.9        9.2       3.7       9.5       6.3    2000000
+orders_even  customers_even  DS_BCAST_INNER  *        4.6        1.5       0.2      16.7      12.8    2000000
+orders_even  customers_even  DS_DIST_BOTH            24.0        8.0       3.7       9.4       6.4    2000000
+orders_even  customers_all   DS_DIST_ALL_NONE*        0.0        0.0       0.0      15.9      10.8    2000000
+
+all strategies returned the same result: yes
+
+== Experiment 2: skew (exponent 8.0) ==
+
+orders_key: join wall 17.6 ms (slowest slice 17.5, fastest 7.5)
+  slice  0:    657146 rows     17.5 ms
+  slice  1:    216983 rows      8.3 ms
+  slice  2:    204657 rows      7.6 ms
+  slice  3:    179230 rows     10.8 ms
+  slice  4:    191159 rows      7.9 ms
+  slice  5:    190867 rows      7.9 ms
+  slice  6:    177037 rows      7.5 ms
+  slice  7:    182921 rows     11.3 ms
+
+orders_even: join wall 15.0 ms (slowest slice 14.9, fastest 9.6)
+  slice  0:    250000 rows      9.7 ms
+  slice  1:    250000 rows      9.7 ms
+  slice  2:    250000 rows      9.6 ms
+  slice  3:    250000 rows     14.9 ms
+  slice  4:    250000 rows     13.7 ms
+  slice  5:    250000 rows     12.0 ms
+  slice  6:    250000 rows     10.1 ms
+  slice  7:    250000 rows     14.9 ms
+
+== Experiment 3: broadcast vs redistribute ==
+predicted crossover at |customers| = |orders|/(N-1) = 666667
+
+   customers   x pred   BCAST cross MB DIST_BOTH cross MB     BCAST ms      BOTH ms
+      166666     0.25              7.6             24.8         26.3         13.5
+      333333     0.50             15.3             26.7         43.5         15.8
+      500000     0.75             22.9             28.6         49.5         16.5
+      666666     1.00             30.5             30.5         94.1         18.0
+      833333     1.25             38.1             32.4         84.8         20.0
+     1000000     1.50             45.8             34.3         96.4         20.9
+     1333333     2.00             61.0             38.1        202.7         25.9

@@ -33,6 +33,8 @@ class ScanOperator final : public Operator {
     std::size_t seg_idx_         = 0;
     std::size_t row_idx_         = 0;
     bool        seg_initialized_ = false;
+    // Column pointers for the current segment; emitted batches borrow this buffer.
+    std::vector<const Vector*> batch_cols_;
 
     // Stats.
     std::size_t segments_scanned_ = 0;

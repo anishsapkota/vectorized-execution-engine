@@ -19,7 +19,7 @@ class FilterOperator final : public Operator {
    private:
     std::unique_ptr<Operator> child_;
     Predicate                 predicate_;
-    // Reused across next() calls — capacity persists, eliminating per-batch allocs.
+    // Reused across next() calls and borrowed by the emitted batch's selection vector.
     std::vector<std::uint32_t> survivors_buf_;
 };
 

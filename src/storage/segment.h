@@ -1,5 +1,9 @@
 #pragma once
 
+#include <memory>
+#include <optional>
+#include <string>
+#include <variant>
 #include <vector>
 
 #include "storage/schema.h"
@@ -50,10 +54,15 @@ class SegmentBuilder {
     std::size_t              num_rows() const { return num_rows_; }
 
    private:
-    Schema                               schema_;
-    std::vector<std::unique_ptr<Vector>> columns_;
-    std::vector<ZoneMap>                 zones_;
-    std::size_t                          num_rows_ = 0;
+    // Raw values per column, in arrival order. seal() sorts them and encodes them into
+    // immutable Vectors.
+    using ColumnBuffer =
+        std::variant<std::vector<int64_t>, std::vector<double>, std::vector<std::string>>;
+
+    Schema                    schema_;
+    std::vector<ColumnBuffer> buffers_;
+    std::vector<ZoneMap>      zones_;
+    std::size_t               num_rows_ = 0;
 };
 
 }  // namespace wb

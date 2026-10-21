@@ -6,55 +6,88 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "storage/schema.h"
 
 namespace wb {
 
+// Columns are immutable once constructed: SegmentBuilder buffers raw values and builds the
+// encoded column in seal().
 class Vector {
    public:
     virtual ~Vector() noexcept       = default;
     virtual DataType    type() const = 0;
     virtual std::size_t size() const = 0;
+    // Heap bytes owned by this column (allocated capacity, not just size).
+    virtual std::size_t memory_bytes() const = 0;
 };
 
+// Frame-of-reference encoded int64 column. Stores `value - base` (base = column minimum) in the
+// narrowest unsigned width that holds the column's range: 1, 2, 4 or 8 bytes per value.
+// Kernels read through visit(), which hands them the typed code array once per batch so the
+// inner loop is a plain widen-and-add.
 class Int64Vector final : public Vector {
    public:
-    Int64Vector()                    = default;
-    ~Int64Vector() noexcept override = default;
-    explicit Int64Vector(std::vector<int64_t> values) : values_(std::move(values)) {}
+    Int64Vector() = default;
+    explicit Int64Vector(std::span<const int64_t> values);
 
     DataType    type() const override { return DataType::Int64; }
-    std::size_t size() const override { return values_.size(); }
+    std::size_t size() const override { return size_; }
+    std::size_t memory_bytes() const override;
 
-    std::span<const int64_t> data() const { return values_; }
+    int64_t     base() const { return base_; }
+    std::size_t width_bytes() const;
 
-    void append(int64_t value) { values_.push_back(value); }
+    template <typename Code>
+    static int64_t decode(int64_t base, Code code) {
+        // Unsigned add: wraps instead of overflowing when the range needs all 64 bits.
+        return static_cast<int64_t>(static_cast<uint64_t>(base) + code);
+    }
 
-    void reset(std::vector<int64_t> values) { values_ = std::move(values); }
+    // Calls f(std::span<const UInt> codes, int64_t base); value i is decode(base, codes[i]).
+    template <typename F>
+    void visit(F&& f) const {
+        std::visit([&](const auto& codes) { f(std::span{codes}, base_); }, codes_);
+    }
+
+    // Scalar access, for cold paths. Hot loops should use visit().
+    int64_t value(std::size_t i) const;
 
    private:
-    std::vector<int64_t> values_;
+    std::variant<std::vector<uint8_t>, std::vector<uint16_t>, std::vector<uint32_t>,
+                 std::vector<uint64_t>>
+                codes_;
+    int64_t     base_ = 0;
+    std::size_t size_ = 0;
 };
 
+// Float64 column, stored as double or, when narrow is set, as float. narrow is lossy: it is
+// only exact for inputs with at most 6 significant decimal digits (FLT_DIG). Reads always
+// widen to double.
 class Float64Vector final : public Vector {
    public:
-    Float64Vector()                    = default;
-    ~Float64Vector() noexcept override = default;
-    explicit Float64Vector(std::vector<double> values) : values_(std::move(values)) {}
+    Float64Vector() = default;
+    explicit Float64Vector(std::vector<double> values, bool narrow = false);
 
     DataType    type() const override { return DataType::Float64; }
-    std::size_t size() const override { return values_.size(); }
+    std::size_t size() const override;
+    std::size_t memory_bytes() const override;
 
-    std::span<const double> data() const { return values_; }
+    bool narrow() const { return std::holds_alternative<std::vector<float>>(values_); }
 
-    void append(double value) { values_.push_back(value); }
+    // Calls f(std::span<const double>) or f(std::span<const float>).
+    template <typename F>
+    void visit(F&& f) const {
+        std::visit([&](const auto& values) { f(std::span{values}); }, values_);
+    }
 
-    void reset(std::vector<double> values) { values_ = std::move(values); }
+    // Scalar access, for cold paths. Hot loops should use visit().
+    double value(std::size_t i) const;
 
    private:
-    std::vector<double> values_;
+    std::variant<std::vector<double>, std::vector<float>> values_;
 };
 
 class StringVector final : public Vector {
@@ -65,12 +98,14 @@ class StringVector final : public Vector {
 
     DataType    type() const override { return DataType::String; }
     std::size_t size() const override { return values_.size(); }
+    std::size_t memory_bytes() const override {
+        std::size_t bytes = values_.capacity() * sizeof(std::string);
+        for (const auto& s : values_)
+            if (s.capacity() > std::string{}.capacity()) bytes += s.capacity() + 1;  // spilled past SSO
+        return bytes;
+    }
 
     const std::vector<std::string>& data() const { return values_; }
-
-    void append(std::string value) { values_.push_back(std::move(value)); }
-
-    void reset(std::vector<std::string> values) { values_ = std::move(values); }
 
    private:
     std::vector<std::string> values_;

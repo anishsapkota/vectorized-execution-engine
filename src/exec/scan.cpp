@@ -1,7 +1,6 @@
 #include "exec/scan.h"
 
 #include <algorithm>
-#include <iostream>
 
 namespace wb {
 
@@ -73,14 +72,19 @@ std::optional<Batch> ScanOperator::next() {
             if (predicate_ && table_.sort_key_col() &&
                 *table_.sort_key_col() == predicate_->col_idx) {
                 const auto& idx = table_.segment(seg_idx_).primary_index();
-                if (!idx.empty()) {
-                    std::size_t new_row = find_starting_row_(idx, *predicate_);
-                    std::cerr << "seg " << seg_idx_ << ": index has " << idx.size() << " entries, "
-                              << "skipping to row " << new_row << " of " << table_.segment(seg_idx_).num_rows() << "\n";
-                    row_idx_ = new_row;
-                } else {
-                    std::cerr << "seg " << seg_idx_ << ": empty primary_index\n";
-                }
+                if (!idx.empty()) row_idx_ = find_starting_row_(idx, *predicate_);
+            }
+
+            // Borrow pointers to projected columns only (or all if no projection). Batches
+            // point into this buffer, so it is rebuilt once per segment, not per batch.
+            const Segment& seg = table_.segment(seg_idx_);
+            batch_cols_.clear();
+            if (projected_cols_.empty()) {
+                for (std::size_t i = 0; i < seg.num_columns(); ++i)
+                    batch_cols_.push_back(&seg.column(i));
+            } else {
+                for (std::size_t i : projected_cols_)
+                    batch_cols_.push_back(&seg.column(i));
             }
 
             seg_initialized_ = true;
@@ -100,22 +104,10 @@ std::optional<Batch> ScanOperator::next() {
         // Clamp to target_batch_size_ so no single batch grows unboundedly.
         std::size_t batch_size = std::min(remaining, static_cast<std::size_t>(target_batch_size_));
 
-        // Borrow pointers to projected columns only (or all if no projection).
-        std::vector<const Vector*> vecs;
-        if (projected_cols_.empty()) {
-            vecs.reserve(seg.num_columns());
-            for (std::size_t i = 0; i < seg.num_columns(); ++i)
-                vecs.push_back(&seg.column(i));
-        } else {
-            vecs.reserve(projected_cols_.size());
-            for (std::size_t i : projected_cols_)
-                vecs.push_back(&seg.column(i));
-        }
-
         // Record where in the column arrays this batch starts, then advance the cursor.
         std::uint32_t offset = static_cast<std::uint32_t>(row_idx_);
         row_idx_ += batch_size;
-        return Batch{std::move(vecs), offset, static_cast<std::uint32_t>(batch_size)};
+        return Batch{batch_cols_, offset, static_cast<std::uint32_t>(batch_size)};
     }
 }
 }  // namespace wb

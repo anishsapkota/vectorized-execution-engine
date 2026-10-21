@@ -10,39 +10,36 @@ namespace wb {
 
 namespace {
 
-// Fill `out` from rows in sel_in that satisfy cmp(data[i], literal).
-// out.clear() resets size but preserves capacity — no alloc on second+ calls.
-template <typename T, typename Compare>
-void filter_kernel(std::span<const T> data, std::span<const std::uint32_t> sel_in, const T& literal,
-                   Compare cmp, std::vector<std::uint32_t>& out) {
-    out.clear();
-    out.reserve(sel_in.size());
-    for (std::uint32_t i : sel_in) {
-        if (cmp(data[i], literal)) out.push_back(i);
-    }
-}
-
-// Same but over a contiguous [start, end) range (no incoming sel vector).
-template <typename T, typename Compare>
-void filter_kernel_range(std::span<const T> data, std::uint32_t start, std::uint32_t end,
-                         const T& literal, Compare cmp, std::vector<std::uint32_t>& out) {
-    out.clear();
-    out.reserve(end - start);
-    for (std::uint32_t i = start; i < end; ++i) {
-        if (cmp(data[i], literal)) out.push_back(i);
-    }
-}
-
-// Switch on CompareOp once per batch, fill out in-place.
-template <typename T>
-void dispatch_op(std::span<const T> data, const Batch& batch, CompareOp op, const T& lit,
-                 std::vector<std::uint32_t>& out) {
-    auto run = [&](auto cmp) {
-        if (batch.sel()) {
-            filter_kernel(data, std::span<const std::uint32_t>(*batch.sel()), lit, cmp, out);
-        } else {
-            filter_kernel_range(data, batch.offset(), batch.offset() + batch.size(), lit, cmp, out);
+// Write the indices of live rows for which pred(i) holds into out, and return how many there are.
+// Branchless: every row index is stored, and the write cursor only advances when pred holds, so
+// mid-selectivity filters don't pay for branch mispredictions. out is grown to the batch size
+// once and keeps its capacity across calls.
+template <typename Pred>
+std::size_t select_rows(const Batch& batch, Pred pred, std::vector<std::uint32_t>& out) {
+    if (out.size() < batch.size()) out.resize(batch.size());
+    std::uint32_t* dst = out.data();
+    std::size_t    n   = 0;
+    if (batch.has_sel()) {
+        for (std::uint32_t i : batch.sel()) {
+            dst[n] = i;
+            n += pred(i);
         }
+    } else {
+        const std::uint32_t end = batch.offset() + batch.size();
+        for (std::uint32_t i = batch.offset(); i < end; ++i) {
+            dst[n] = i;
+            n += pred(i);
+        }
+    }
+    return n;
+}
+
+// Switch on CompareOp once per batch. get(i) reads row i of the filtered column.
+template <typename Get, typename T>
+std::size_t dispatch_op(const Batch& batch, Get get, CompareOp op, const T& lit,
+                        std::vector<std::uint32_t>& out) {
+    auto run = [&](auto cmp) {
+        return select_rows(batch, [&](std::uint32_t i) { return cmp(get(i), lit); }, out);
     };
 
     switch (op) {
@@ -59,6 +56,7 @@ void dispatch_op(std::span<const T> data, const Batch& batch, CompareOp op, cons
         case CompareOp::Ge:
             return run(std::greater_equal<>{});
     }
+    return 0;
 }
 
 }  // anonymous namespace
@@ -74,34 +72,39 @@ std::optional<Batch> FilterOperator::next() {
 
         const Vector& col = batch->column(predicate_.col_idx);
 
-        // Dispatch on (column type × op) once per batch.
-        // survivors_buf_ is reused across calls — capacity grows to high-water mark
-        // and stays there, eliminating per-batch heap allocation.
+        // Dispatch on (column type × encoding × op) once per batch.
+        // survivors_buf_ is reused across calls — it grows to the largest batch size and stays
+        // there, and the returned batch borrows it, so no per-batch heap allocation.
+        std::size_t n = 0;
         switch (col.type()) {
             case DataType::Int64: {
-                auto    data = static_cast<const Int64Vector&>(col).data();
-                int64_t lit  = std::get<int64_t>(predicate_.value);
-                dispatch_op(data, *batch, predicate_.op, lit, survivors_buf_);
+                int64_t lit = std::get<int64_t>(predicate_.value);
+                static_cast<const Int64Vector&>(col).visit([&](auto codes, int64_t base) {
+                    auto get = [&](std::uint32_t i) { return Int64Vector::decode(base, codes[i]); };
+                    n        = dispatch_op(*batch, get, predicate_.op, lit, survivors_buf_);
+                });
                 break;
             }
             case DataType::Float64: {
-                auto   data = static_cast<const Float64Vector&>(col).data();
-                double lit  = std::get<double>(predicate_.value);
-                dispatch_op(data, *batch, predicate_.op, lit, survivors_buf_);
+                double lit = std::get<double>(predicate_.value);
+                static_cast<const Float64Vector&>(col).visit([&](auto values) {
+                    auto get = [&](std::uint32_t i) { return static_cast<double>(values[i]); };
+                    n        = dispatch_op(*batch, get, predicate_.op, lit, survivors_buf_);
+                });
                 break;
             }
             case DataType::String: {
-                std::span<const std::string> data = static_cast<const StringVector&>(col).data();
-                const std::string&           lit  = std::get<std::string>(predicate_.value);
-                dispatch_op(data, *batch, predicate_.op, lit, survivors_buf_);
+                const auto&        values = static_cast<const StringVector&>(col).data();
+                const std::string& lit    = std::get<std::string>(predicate_.value);
+                auto get = [&](std::uint32_t i) -> const std::string& { return values[i]; };
+                n        = dispatch_op(*batch, get, predicate_.op, lit, survivors_buf_);
                 break;
             }
         }
 
-        if (survivors_buf_.empty()) continue;
+        if (n == 0) continue;
 
-        // Copy survivors into the batch. survivors_buf_ keeps its capacity for next call.
-        batch->set_sel(survivors_buf_);
+        batch->set_sel(std::span<const std::uint32_t>(survivors_buf_.data(), n));
         return batch;
     }
 }

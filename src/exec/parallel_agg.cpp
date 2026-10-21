@@ -4,6 +4,7 @@
 #include <thread>
 #include <vector>
 
+#include "exec/agg_kernel.h"
 #include "storage/segment.h"
 #include "storage/vector.h"
 
@@ -19,19 +20,15 @@ void worker_loop(const Table& table, std::size_t group_col_idx, std::size_t agg_
         // worker just claimed.
         std::size_t seg_idx = next_seg.fetch_add(1, std::memory_order_relaxed);
         if (seg_idx >= total) break;
-        const Segment& seg     = table.segment(seg_idx);
-        const auto&    key_vec = static_cast<const Int64Vector&>(seg.column(group_col_idx));
-        const auto&    val_vec = static_cast<const Float64Vector&>(seg.column(agg_col_idx));
+        const Segment& seg  = table.segment(seg_idx);
+        const auto& keys = static_cast<const Int64Vector&>(seg.column(group_col_idx));
+        const auto& vals = static_cast<const Float64Vector&>(seg.column(agg_col_idx));
 
-        auto keys = key_vec.data();
-        auto vals = val_vec.data();
-
-        const std::size_t n = seg.num_rows();
-        for (std::size_t i = 0; i < n; ++i) {
-            auto& v = local_ht.find_or_insert(keys[i]);
-            v.sum += vals[i];
-            v.count += 1;
-        }
+        const auto n = static_cast<std::uint32_t>(seg.num_rows());
+        accumulate_sum_count(local_ht, keys, vals, [&](auto f) {
+            for (std::uint32_t i = 0; i < n; ++i)
+                f(i);
+        });
     }
 }
 

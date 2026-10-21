@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -39,13 +40,11 @@ class HashAggOperator final : public Operator {
     bool         built_ = false;
 
     // Output emission state
-    std::vector<int64_t> out_keys_;
-    std::vector<double>  out_sums_;
-    std::vector<int64_t> out_counts_;
-
     std::unique_ptr<Int64Vector>   out_key_vec_;
     std::unique_ptr<Float64Vector> out_sum_vec_;
     std::unique_ptr<Int64Vector>   out_count_vec_;
+    // Column list borrowed by emitted batches.
+    std::array<const Vector*, 3> out_cols_{};
 
     std::size_t   emit_cursor_     = 0;
     std::uint32_t emit_batch_size_ = 4096;

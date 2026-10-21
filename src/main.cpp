@@ -265,11 +265,11 @@ int main() {
                 int64_t rows = 0;
                 while (auto batch = filter->next()) {
                     // batch col 1 = original col 2 = value
-                    const auto& vals = static_cast<const Float64Vector&>(batch->column(1)).data();
-                    for (std::uint32_t i : *batch->sel()) {
-                        sum += vals[i];
-                        ++rows;
-                    }
+                    static_cast<const Float64Vector&>(batch->column(1)).visit([&](auto vals) {
+                        for (std::uint32_t i : batch->sel())
+                            sum += vals[i];
+                    });
+                    rows += batch->size();
                 }
                 auto t1 = steady_clock::now();
 
@@ -308,12 +308,12 @@ int main() {
                 double      total_sum   = 0.0;
                 int64_t     total_count = 0;
                 while (auto batch = agg->next()) {
-                    const auto&   sums = static_cast<const Float64Vector&>(batch->column(1)).data();
-                    const auto&   counts = static_cast<const Int64Vector&>(batch->column(2)).data();
+                    const auto&   sums   = static_cast<const Float64Vector&>(batch->column(1));
+                    const auto&   counts = static_cast<const Int64Vector&>(batch->column(2));
                     std::uint32_t end    = batch->offset() + batch->size();
                     for (std::uint32_t i = batch->offset(); i < end; ++i) {
-                        total_sum += sums[i];
-                        total_count += counts[i];
+                        total_sum += sums.value(i);
+                        total_count += counts.value(i);
                         ++groups;
                     }
                 }

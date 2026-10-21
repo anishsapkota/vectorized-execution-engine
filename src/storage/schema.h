@@ -11,6 +11,9 @@ enum class DataType : std::uint8_t { Int64, Float64, String };
 struct ColumnDef {
     std::string name;
     DataType    type;
+    // Float64 only: store values as float. Lossy in general; exact for inputs with at most
+    // 6 significant decimal digits.
+    bool narrow_float = false;
 };
 
 using Schema = std::vector<ColumnDef>;
