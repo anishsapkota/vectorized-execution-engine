@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -603,4 +604,29 @@ TEST(cg_median_narrow_float_scan_and_join) {
     auto devices = make_readings(2'000, 500, /*narrow_float=*/true);
     check_engines_agree(*aggregate(join(scan(*t, {0, 2}), scan(*devices, {0, 2}), 0, 0), 0,
                                    {{AggFn::Median, 1}, {AggFn::Median, 3}}));
+}
+
+TEST(median_selection_is_not_quadratic_on_organ_pipe_data) {
+    // Rise-then-fall values defeat a middle-element pivot (quadratic); selection must stay
+    // O(n log n) in both engines. 400k values took ~28 s with the old middle pivot.
+    constexpr int64_t n = 400'000;
+    MedianStore<double>        engine;
+    wb_rt::MedianStore<double> rt;
+    MedianHandle               eh;
+    wb_rt::MedianHandle        rh;
+    std::vector<double>        values;
+    for (int64_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(i < n / 2 ? i : n - i);
+        values.push_back(v);
+        engine.append(eh, v);
+        rt.append(rh, v);
+    }
+    std::sort(values.begin(), values.end());
+    const double want  = (values[n / 2 - 1] + values[n / 2]) / 2.0;
+    const auto   start = std::chrono::steady_clock::now();
+    CHECK_EQ(engine.finalize_single(eh), want);
+    CHECK_EQ(rt.finalize_single(rh), want);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    CHECK(seconds < 2.0);
+    rt.release();
 }

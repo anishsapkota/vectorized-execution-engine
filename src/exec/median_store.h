@@ -113,19 +113,42 @@ class MedianStore {
         return next_block_++;
     }
 
-    // Three-way quickselect through an accessor: afterwards get(k) holds the k-th smallest value
-    // and every element before k is <= it (same algorithm as the codegen runtime).
+    // Introselect through an accessor: three-way quickselect with median-of-three pivots, falling
+    // back to heapsort after 2 log2(n) rounds, so the worst case is O(n log n). Afterwards get(k)
+    // holds the k-th smallest value and every element before k is <= it (same algorithm as the
+    // codegen runtime).
     template <typename Get>
     static double select_in_place_(std::size_t n, Get get) {
-        const std::size_t k  = n / 2;
-        std::size_t       lo = 0, hi = n;
+        using size_t = std::size_t;
+        const size_t k     = n / 2;
+        size_t       lo    = 0, hi = n;
+        size_t       depth = 2;  // 2 * floor(log2(n)) + 2 partition rounds, then heapsort
+        for (size_t m = n; m > 1; m >>= 1)
+            depth += 2;
         while (hi - lo > 1) {
-            const T     pivot = get(lo + (hi - lo) / 2);
-            std::size_t lt = lo, i = lo, gt = hi;  // [lo,lt) < pivot, [lt,i) == pivot, [gt,hi) > pivot
+            if (depth-- == 0) {
+                heapsort_(lo, hi, get);  // guaranteed O(m log m); range ends fully sorted
+                break;
+            }
+            // Median-of-three pivot value (first, middle, last).
+            T a = get(lo), b = get(lo + (hi - lo) / 2), c = get(hi - 1);
+            if (median_less(b, a)) { const T t = a; a = b; b = t; }
+            if (median_less(c, b)) { b = c; }
+            if (median_less(b, a)) { b = a; }
+            const T pivot = b;
+            size_t  lt = lo, i = lo, gt = hi;  // [lo,lt) < pivot, [lt,i) == pivot, [gt,hi) > pivot
             while (i < gt) {
-                if (median_less(get(i), pivot)) std::swap(get(lt++), get(i++));
-                else if (median_less(pivot, get(i))) std::swap(get(--gt), get(i));
-                else ++i;
+                if (median_less(get(i), pivot)) {
+                    const T t = get(lt);
+                    get(lt++) = get(i);
+                    get(i++)  = t;
+                } else if (median_less(pivot, get(i))) {
+                    const T t = get(--gt);
+                    get(gt)   = get(i);
+                    get(i)    = t;
+                } else {
+                    ++i;
+                }
             }
             if (k < lt) hi = lt;
             else if (k >= gt) lo = gt;
@@ -133,9 +156,35 @@ class MedianStore {
         }
         if (n % 2) return static_cast<double>(get(k));
         T left = get(0);
-        for (std::size_t i = 1; i < k; ++i)
+        for (size_t i = 1; i < k; ++i)
             if (median_less(left, get(i))) left = get(i);
         return (static_cast<double>(left) + static_cast<double>(get(k))) / 2.0;
+    }
+
+    // In-place heapsort of [lo, hi) under median_less, through the accessor.
+    template <class Get>
+    static void heapsort_(size_t lo, size_t hi, Get& get) {
+        const size_t m    = hi - lo;
+        auto         sift = [&](size_t root, size_t end) {
+            for (;;) {
+                size_t child = 2 * root + 1;
+                if (child >= end) return;
+                if (child + 1 < end && median_less(get(lo + child), get(lo + child + 1))) ++child;
+                if (!median_less(get(lo + root), get(lo + child))) return;
+                const T t         = get(lo + root);
+                get(lo + root)    = get(lo + child);
+                get(lo + child)   = t;
+                root              = child;
+            }
+        };
+        for (size_t start = m / 2; start-- > 0;)
+            sift(start, m);
+        for (size_t end = m; end-- > 1;) {
+            const T t      = get(lo);
+            get(lo)        = get(lo + end);
+            get(lo + end)  = t;
+            sift(0, end);
+        }
     }
 
     static double select_(T* values, std::size_t n) {
