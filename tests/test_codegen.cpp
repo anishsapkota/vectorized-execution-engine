@@ -12,12 +12,19 @@
 #include <vector>
 
 #include "codegen/compiler.h"
+#include "codegen/host.h"
 #include "codegen/runtime.h"
 #include "exec/hash_table.h"
+#include "plan/lower_vec.h"
+#include "plan/plan.h"
+#include "storage/segment.h"
 #include "test_framework.h"
+#include "test_util.h"
 
 using namespace wb;
 using namespace wb::codegen;
+using namespace wb::plan;
+using wbtest::make_readings;
 
 namespace {
 
@@ -61,6 +68,23 @@ std::string codegen_error_text(F&& f) {
         return e.what();
     }
     return "";
+}
+
+// Runs `root` on both engines; they must agree bit for bit.
+QueryResult check_engines_agree(const Node& root) {
+    const auto vec = run_vectorized(root);
+    const auto cg  = run_compiled(root);
+    if (!(cg == vec)) throw wbtest::TestFailure(to_string(root) + ": compiled vs vectorized: " + cg.diff(vec));
+    return cg;
+}
+
+std::pair<int64_t, int64_t> ts_range(const Table& t) {
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (const auto& seg : t.segments()) {
+        lo = std::min(lo, seg->zone(1).min_i64());
+        hi = std::max(hi, seg->zone(1).max_i64());
+    }
+    return {lo, hi};
 }
 
 }  // namespace
@@ -193,4 +217,91 @@ TEST(cache_key_depends_on_opt_level) {
 TEST(cache_key_depends_on_runtime_header) {
     const auto src = test_source("key_runtime");
     CHECK(cache_key(src, {}, "a") != cache_key(src, {}, "b"));
+}
+
+TEST(cg_q1_q4_shapes) {
+    fresh_cache_dir();
+    auto t        = make_readings(200'000);
+    auto [lo, hi] = ts_range(*t);
+    const int64_t mid = lo + (hi - lo) / 2;
+    check_engines_agree(*sum_count(filter(scan(*t, {1, 2}), {{0, CompareOp::Gt, mid}}), std::nullopt, 1));
+    check_engines_agree(*sum_count(filter(scan(*t, {2}), {{0, CompareOp::Gt, 50.0}}), std::nullopt, 0));
+    check_engines_agree(*sum_count(
+        filter(scan(*t, {2, 0}), {{0, CompareOp::Gt, 50.0}, {1, CompareOp::Lt, int64_t{150}}}), std::nullopt, 0));
+    const auto grouped = check_engines_agree(*sum_count(scan(*t, {0, 2}), 0, 1));
+    CHECK_EQ(grouped.num_rows(), std::size_t{300});
+}
+
+TEST(cg_sort_key_ops) {
+    fresh_cache_dir();
+    auto          t    = make_readings(100'000);
+    const int64_t real = t->segment(5).zone(1).min_i64();  // a ts value that exists
+    for (CompareOp op : {CompareOp::Gt, CompareOp::Ge, CompareOp::Eq, CompareOp::Lt, CompareOp::Ne}) {
+        check_engines_agree(*sum_count(filter(scan(*t, {1, 2}), {{0, op, real}}), std::nullopt, 1));
+    }
+}
+
+TEST(cg_extreme_keys) {
+    // One segment needs 8-byte FOR codes (range spans all of int64); the others need 2 bytes.
+    fresh_cache_dir();
+    Schema schema{{"k", DataType::Int64}, {"v", DataType::Float64}};
+    Table  t{"extreme", schema};
+    const std::vector<int64_t> wide{INT64_MIN + 1, INT64_MAX, -1, 0, -9'000'000'000'000LL, 42};
+    std::size_t                rows = 0;
+    for (int seg = 0; seg < 4; ++seg) {
+        SegmentBuilder b{schema};
+        for (int i = 0; i < 1'000; ++i) {
+            const int64_t k = seg == 2 ? wide[i % wide.size()] : 1'000 + (i % 37) - 18;
+            b.append_int64(0, k);
+            b.append_float64(1, 0.5 * i + seg);
+            ++rows;
+        }
+        t.add_segment(b.seal(std::nullopt, 1024));
+    }
+    CHECK_EQ(static_cast<const Int64Vector&>(t.segment(2).column(0)).width_bytes(), std::size_t{8});
+
+    const auto grouped = check_engines_agree(*sum_count(scan(t, {0, 1}), 0, 1));
+    int64_t    total   = 0;
+    for (int64_t c : grouped.counts)
+        total += c;
+    CHECK_EQ(total, static_cast<int64_t>(rows));
+    check_engines_agree(*sum_count(filter(scan(t, {0, 1}), {{0, CompareOp::Gt, int64_t{INT64_MIN}}}), 0, 1));
+    check_engines_agree(*sum_count(filter(scan(t, {0, 1}), {{0, CompareOp::Lt, int64_t{0}}}), std::nullopt, 1));
+}
+
+TEST(cg_all_pruned) {
+    fresh_cache_dir();
+    auto t        = make_readings(50'000);
+    auto [lo, hi] = ts_range(*t);
+    const auto r  = check_engines_agree(*sum_count(filter(scan(*t, {1, 2}), {{0, CompareOp::Gt, hi}}), std::nullopt, 1));
+    CHECK_EQ(r.num_rows(), std::size_t{1});
+    CHECK_EQ(r.counts[0], int64_t{0});
+}
+
+TEST(narrow_float_filter_matches) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000, 8'000, /*narrow_float=*/true);
+    check_engines_agree(*sum_count(filter(scan(*t, {2}), {{0, CompareOp::Gt, 50.1}}), std::nullopt, 0));
+    check_engines_agree(*sum_count(filter(scan(*t, {0, 2}), {{1, CompareOp::Le, 50.1}}), 0, 1));
+}
+
+TEST(cg_prune_uses_table_column_through_projection) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000);
+    check_engines_agree(*sum_count(filter(scan(*t, {2, 1}), {{0, CompareOp::Gt, 80.0}}), std::nullopt, 0));
+}
+
+TEST(empty_table_cg) {
+    fresh_cache_dir();
+    auto       t      = make_readings(0);
+    const auto global = check_engines_agree(*sum_count(scan(*t, {2}), std::nullopt, 0));
+    CHECK_EQ(global.num_rows(), std::size_t{1});
+    CHECK_EQ(check_engines_agree(*sum_count(scan(*t, {0, 2}), 0, 1)).num_rows(), std::size_t{0});
+}
+
+TEST(cg_rejects_join_for_now) {
+    fresh_cache_dir();
+    auto t    = make_readings(1'000);
+    auto text = codegen_error_text([&] { run_compiled(*sum_count(join(scan(*t, {0, 2}), scan(*t, {0}), 0, 0), 0, 1)); });
+    CHECK(text.find("HashJoin") != std::string::npos);
 }

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,6 +58,31 @@ inline KeyValueRows collect(wb::Operator& op) {
 inline KeyValueRows collect(const wb::Table& table) {
     wb::ScanOperator scan{table, std::nullopt};
     return collect(scan);
+}
+
+// readings-shaped table: device_id 1..300, ts a random walk (sorted per segment), value ~N(50,15).
+inline std::unique_ptr<wb::Table> make_readings(std::size_t rows, std::size_t rows_per_segment = 8'000,
+                                     bool narrow_float = false) {
+    wb::Schema schema{{"device_id", wb::DataType::Int64},
+                  {"ts", wb::DataType::Int64},
+                  {"value", wb::DataType::Float64, narrow_float}};
+    auto   t = std::make_unique<wb::Table>("readings", schema, 1);
+    std::mt19937_64                        rng{7};
+    std::uniform_int_distribution<int64_t> device{1, 300};
+    std::uniform_int_distribution<int64_t> jitter{-30, 30};
+    std::normal_distribution<double>       value{50.0, 15.0};
+    int64_t                                ts = 1'700'000'000;
+    for (std::size_t start = 0; start < rows; start += rows_per_segment) {
+        wb::SegmentBuilder b{schema};
+        for (std::size_t r = start; r < std::min(rows, start + rows_per_segment); ++r) {
+            ts += 1 + jitter(rng);
+            b.append_int64(0, device(rng));
+            b.append_int64(1, ts);
+            b.append_float64(2, value(rng));
+        }
+        t->add_segment(b.seal(1, 1024));
+    }
+    return t;
 }
 
 }  // namespace wbtest
