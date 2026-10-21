@@ -307,7 +307,7 @@ TEST(cg_extreme_keys) {
 
     const auto grouped = check_engines_agree(*sum_count(scan(t, {0, 1}), 0, 1));
     int64_t    total   = 0;
-    for (int64_t c : grouped.counts)
+    for (int64_t c : grouped.columns[2].ints)
         total += c;
     CHECK_EQ(total, static_cast<int64_t>(rows));
     check_engines_agree(*sum_count(filter(scan(t, {0, 1}), {{0, CompareOp::Gt, int64_t{INT64_MIN}}}), 0, 1));
@@ -320,7 +320,7 @@ TEST(cg_all_pruned) {
     auto [lo, hi] = ts_range(*t);
     const auto r  = check_engines_agree(*sum_count(filter(scan(*t, {1, 2}), {{0, CompareOp::Gt, hi}}), std::nullopt, 1));
     CHECK_EQ(r.num_rows(), std::size_t{1});
-    CHECK_EQ(r.counts[0], int64_t{0});
+    CHECK_EQ(r.int_at(1, 0), int64_t{0});
 }
 
 TEST(narrow_float_filter_matches) {
@@ -368,7 +368,7 @@ TEST(cg_join_no_matches) {
              std::size_t{0});
     const auto global =
         check_engines_agree(*sum_count(join(scan(t->probe, {0, 1}), scan(t->build, {0, 1}), 0, 0), std::nullopt, 1));
-    CHECK_EQ(global.counts[0], int64_t{0});
+    CHECK_EQ(global.int_at(1, 0), int64_t{0});
 }
 
 TEST(empty_table_cg_join) {

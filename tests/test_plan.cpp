@@ -20,13 +20,25 @@ using wbtest::make_readings;
 
 namespace {
 
-QueryResult grouped(std::vector<int64_t> keys, std::vector<double> sums,
-                    std::vector<int64_t> counts) {
+ResultColumn int_column(const std::vector<int64_t>& values) {
+    ResultColumn c{DataType::Int64, {}, {}, {}};
+    for (int64_t v : values)
+        c.push_int(v);
+    return c;
+}
+
+ResultColumn double_column(const std::vector<double>& values) {
+    ResultColumn c{DataType::Float64, {}, {}, {}};
+    for (double v : values)
+        c.push_double(v);
+    return c;
+}
+
+// [key, sum, count], the SumCount shape.
+QueryResult grouped(std::vector<int64_t> keys, std::vector<double> sums, std::vector<int64_t> counts) {
     QueryResult r;
     r.grouped = true;
-    r.keys    = std::move(keys);
-    r.sums    = std::move(sums);
-    r.counts  = std::move(counts);
+    r.columns = {int_column(keys), double_column(sums), int_column(counts)};
     return r;
 }
 
@@ -116,24 +128,29 @@ QueryResult reference(const Node& root) {
     QueryResult r;
     r.grouped = agg.group_col.has_value();
     std::map<int64_t, std::size_t> slot;  // key -> row in r
+    std::vector<int64_t>           keys, counts;
+    std::vector<double>            sums;
     if (!r.grouped) {
-        r.sums   = {0.0};
-        r.counts = {0};
+        sums   = {0.0};
+        counts = {0};
     }
     for (const auto& row : reference_rows(*agg.child)) {
         std::size_t at = 0;
         if (r.grouped) {
-            auto [it, fresh] = slot.try_emplace(row[*agg.group_col].i, r.keys.size());
+            auto [it, fresh] = slot.try_emplace(row[*agg.group_col].i, keys.size());
             if (fresh) {
-                r.keys.push_back(it->first);
-                r.sums.push_back(0.0);
-                r.counts.push_back(0);
+                keys.push_back(it->first);
+                sums.push_back(0.0);
+                counts.push_back(0);
             }
             at = it->second;
         }
-        r.sums[at] += row[agg.sum_col].d;
-        ++r.counts[at];
+        sums[at] += row[agg.sum_col].d;
+        ++counts[at];
     }
+    if (r.grouped) r.columns.push_back(int_column(keys));
+    r.columns.push_back(double_column(sums));
+    r.columns.push_back(int_column(counts));
     r.canonicalize();
     return r;
 }
@@ -158,9 +175,32 @@ TEST(result_equality_is_bitwise) {
 TEST(result_canonicalize_sorts_by_key) {
     auto r = grouped({3, 1, 2}, {30.0, 10.0, 20.0}, {3, 1, 2});
     r.canonicalize();
-    CHECK(r.keys == (std::vector<int64_t>{1, 2, 3}));
-    CHECK(r.sums == (std::vector<double>{10.0, 20.0, 30.0}));
-    CHECK(r.counts == (std::vector<int64_t>{1, 2, 3}));
+    CHECK(r.columns[0].ints == (std::vector<int64_t>{1, 2, 3}));
+    CHECK(r.columns[1].doubles == (std::vector<double>{10.0, 20.0, 30.0}));
+    CHECK(r.columns[2].ints == (std::vector<int64_t>{1, 2, 3}));
+}
+
+TEST(result_nulls_compare_equal_regardless_of_bytes) {
+    QueryResult a, b, c;
+    a.columns = {double_column({0.0})};
+    b.columns = {double_column({0.0})};
+    c.columns = {double_column({1.0})};
+    a.columns[0].doubles[0] = 1.0;
+    a.columns[0].valid[0]   = 0;
+    b.columns[0].doubles[0] = 2.0;
+    b.columns[0].valid[0]   = 0;
+    CHECK(a == b);
+    CHECK(!(a == c));
+    CHECK(a.is_null(0, 0));
+    CHECK(!c.is_null(0, 0));
+}
+
+TEST(result_diff_names_column) {
+    auto a = grouped({1}, {1.0}, {1});
+    auto b = grouped({1}, {1.0}, {2});
+    const auto d = a.diff(b);
+    CHECK(d.find("col 2") != std::string::npos);
+    CHECK(d.find("row 0") != std::string::npos);
 }
 
 TEST(result_checksum_order_independent) {
@@ -259,8 +299,8 @@ TEST(empty_table_vec) {
     auto t      = make_readings(0);
     auto global = run_vectorized(*sum_count(scan(*t, {2}), std::nullopt, 0));
     CHECK_EQ(global.num_rows(), std::size_t{1});
-    CHECK_EQ(global.counts[0], int64_t{0});
-    CHECK_EQ(global.sums[0], 0.0);
+    CHECK_EQ(global.int_at(1, 0), int64_t{0});
+    CHECK_EQ(global.double_at(0, 0), 0.0);
     CHECK_EQ(run_vectorized(*sum_count(scan(*t, {0, 2}), 0, 1)).num_rows(), std::size_t{0});
 }
 

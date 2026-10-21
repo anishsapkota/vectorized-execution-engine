@@ -9,10 +9,6 @@ namespace wb::plan {
 
 namespace {
 
-bool same_bits(double a, double b) {
-    return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
-}
-
 void fnv_mix(std::uint64_t& h, std::uint64_t v) {
     for (int i = 0; i < 8; ++i) {
         h ^= (v >> (8 * i)) & 0xFF;
@@ -20,22 +16,52 @@ void fnv_mix(std::uint64_t& h, std::uint64_t v) {
     }
 }
 
+// Bit pattern of a cell; 0 with a NULL marker for NULLs so stored bytes do not matter.
+std::uint64_t cell_bits(const ResultColumn& c, std::size_t row) {
+    if (!c.valid[row]) return 0;
+    return c.type == DataType::Int64 ? static_cast<std::uint64_t>(c.ints[row])
+                                     : std::bit_cast<std::uint64_t>(c.doubles[row]);
+}
+
+std::string cell_text(const ResultColumn& c, std::size_t row) {
+    if (!c.valid[row]) return "NULL";
+    std::ostringstream out;
+    out.precision(17);
+    if (c.type == DataType::Int64) out << c.ints[row];
+    else out << c.doubles[row];
+    return out.str();
+}
+
 }  // namespace
 
+void ResultColumn::push_int(int64_t v, bool is_valid) {
+    ints.push_back(v);
+    valid.push_back(is_valid);
+}
+
+void ResultColumn::push_double(double v, bool is_valid) {
+    doubles.push_back(v);
+    valid.push_back(is_valid);
+}
+
 void QueryResult::canonicalize() {
-    if (!grouped) return;
+    if (!grouped || columns.empty()) return;
+    const auto&              keys = columns[0].ints;
     std::vector<std::size_t> order(keys.size());
     std::iota(order.begin(), order.end(), std::size_t{0});
     std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return keys[a] < keys[b]; });
 
-    auto permute = [&](auto& column) {
-        auto copy = column;
+    auto permute = [&](auto& values) {
+        if (values.empty()) return;
+        auto copy = values;
         for (std::size_t i = 0; i < order.size(); ++i)
-            column[i] = copy[order[i]];
+            values[i] = copy[order[i]];
     };
-    permute(keys);
-    permute(sums);
-    permute(counts);
+    for (auto& c : columns) {
+        permute(c.ints);
+        permute(c.doubles);
+        permute(c.valid);
+    }
 }
 
 bool QueryResult::operator==(const QueryResult& other) const { return diff(other).empty(); }
@@ -43,32 +69,43 @@ bool QueryResult::operator==(const QueryResult& other) const { return diff(other
 std::uint64_t QueryResult::checksum() const {
     std::uint64_t h = 0xCBF29CE484222325ULL;
     fnv_mix(h, grouped);
-    for (std::size_t i = 0; i < num_rows(); ++i) {
-        if (grouped) fnv_mix(h, static_cast<std::uint64_t>(keys[i]));
-        fnv_mix(h, std::bit_cast<std::uint64_t>(sums[i]));
-        fnv_mix(h, static_cast<std::uint64_t>(counts[i]));
+    for (std::size_t row = 0; row < num_rows(); ++row) {
+        for (const auto& c : columns) {
+            fnv_mix(h, c.valid[row]);
+            fnv_mix(h, cell_bits(c, row));
+        }
     }
     return h;
 }
 
 std::string QueryResult::diff(const QueryResult& other) const {
     std::ostringstream out;
-    out.precision(17);
     if (grouped != other.grouped) {
         out << "grouped " << grouped << " vs " << other.grouped;
         return out.str();
+    }
+    if (columns.size() != other.columns.size()) {
+        out << "column count " << columns.size() << " vs " << other.columns.size();
+        return out.str();
+    }
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        if (columns[c].type != other.columns[c].type) {
+            out << "col " << c << ": type " << type_name(columns[c].type) << " vs " << type_name(other.columns[c].type);
+            return out.str();
+        }
     }
     if (num_rows() != other.num_rows()) {
         out << "row count " << num_rows() << " vs " << other.num_rows();
         return out.str();
     }
-    for (std::size_t i = 0; i < num_rows(); ++i) {
-        const bool key_differs = grouped && keys[i] != other.keys[i];
-        if (key_differs || !same_bits(sums[i], other.sums[i]) || counts[i] != other.counts[i]) {
-            out << "row " << i << ": (" << (grouped ? keys[i] : 0) << ", " << sums[i] << ", "
-                << counts[i] << ") vs (" << (grouped ? other.keys[i] : 0) << ", " << other.sums[i]
-                << ", " << other.counts[i] << ")";
-            return out.str();
+    for (std::size_t row = 0; row < num_rows(); ++row) {
+        for (std::size_t c = 0; c < columns.size(); ++c) {
+            const auto& a = columns[c];
+            const auto& b = other.columns[c];
+            if (a.valid[row] != b.valid[row] || cell_bits(a, row) != cell_bits(b, row)) {
+                out << "col " << c << " row " << row << ": " << cell_text(a, row) << " vs " << cell_text(b, row);
+                return out.str();
+            }
         }
     }
     return "";

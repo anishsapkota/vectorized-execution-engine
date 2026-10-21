@@ -49,17 +49,21 @@ QueryResult run_vectorized(const Node& root) {
     auto        input = lower(*agg.child);
 
     QueryResult result;
+    result.grouped = agg.group_col.has_value();
+    if (result.grouped) result.columns.push_back({DataType::Int64, {}, {}, {}});
+    result.columns.push_back({DataType::Float64, {}, {}, {}});
+    result.columns.push_back({DataType::Int64, {}, {}, {}});
+    auto& cols = result.columns;
     if (agg.group_col) {
-        result.grouped = true;
         HashAggOperator op{std::move(input), *agg.group_col, agg.sum_col};
         while (auto batch = op.next()) {
             const auto& keys   = static_cast<const Int64Vector&>(batch->column(0));
             const auto& sums   = static_cast<const Float64Vector&>(batch->column(1));
             const auto& counts = static_cast<const Int64Vector&>(batch->column(2));
             for_each_live_row(*batch, [&](std::uint32_t row) {
-                result.keys.push_back(keys.value(row));
-                result.sums.push_back(sums.value(row));
-                result.counts.push_back(counts.value(row));
+                cols[0].push_int(keys.value(row));
+                cols[1].push_double(sums.value(row));
+                cols[2].push_int(counts.value(row));
             });
         }
     } else {
@@ -71,8 +75,8 @@ QueryResult run_vectorized(const Node& root) {
             });
             count += batch->size();
         }
-        result.sums   = {sum};
-        result.counts = {count};
+        cols[0].push_double(sum);
+        cols[1].push_int(count);
     }
     result.canonicalize();
     return result;

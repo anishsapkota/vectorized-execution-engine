@@ -61,10 +61,11 @@ void bind_inputs(const std::vector<ScanBinding>& bindings, BoundInput& bound) {
 }
 
 void collect_group(void* ctx, int64_t key, double sum, int64_t count) {
-    auto* r = static_cast<plan::QueryResult*>(ctx);
-    if (r->grouped) r->keys.push_back(key);
-    r->sums.push_back(sum);
-    r->counts.push_back(count);
+    auto*       r = static_cast<plan::QueryResult*>(ctx);
+    std::size_t c = 0;
+    if (r->grouped) r->columns[c++].push_int(key);
+    r->columns[c++].push_double(sum);
+    r->columns[c].push_int(count);
 }
 
 }  // namespace
@@ -91,6 +92,9 @@ plan::QueryResult execute(const PreparedQuery& query) {
 
     plan::QueryResult  result;
     result.grouped = query.grouped;
+    if (result.grouped) result.columns.push_back({DataType::Int64, {}, {}, {}});
+    result.columns.push_back({DataType::Float64, {}, {}, {}});
+    result.columns.push_back({DataType::Int64, {}, {}, {}});
     wb_rt::QueryOutput out{&result, collect_group};
     const int          rc = query.compiled.fn(&bound.input, &out);
     if (rc == 1) throw CodegenError("codegen: a segment's width signature was not compiled (stale library?)");
