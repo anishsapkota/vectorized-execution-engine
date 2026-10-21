@@ -1,6 +1,8 @@
 // Compiled engine: runtime header, compiler/cache, generator, and differential tests against the
 // vectorized engine (results must be bit-identical).
 
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <bit>
@@ -371,4 +373,31 @@ TEST(join_with_filters_on_both_sides) {
     check_engines_agree(*sum_count(join(filter(scan(t->probe, {1, 0}), {{0, CompareOp::Gt, 300.0}}),
                                         filter(scan(t->build, {1, 0}), {{0, CompareOp::Lt, int64_t{4}}}), 1, 1),
                                    3, 0));
+}
+
+TEST(concurrent_processes_share_cache) {
+    // Several processes missing the cache for the same key at once must all succeed.
+    fresh_cache_dir();
+    const auto        src = test_source("concurrent_cache");
+    std::vector<pid_t> children;
+    for (int i = 0; i < 8; ++i) {
+        const pid_t pid = fork();
+        if (pid == 0) {
+            int code = 0;
+            try {
+                compile_source(src, {});
+            } catch (...) {
+                code = 1;
+            }
+            _exit(code);
+        }
+        children.push_back(pid);
+    }
+    int failures = 0;
+    for (pid_t pid : children) {
+        int status = 0;
+        waitpid(pid, &status, 0);
+        failures += !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    CHECK_EQ(failures, 0);
 }

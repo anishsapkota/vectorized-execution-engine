@@ -212,17 +212,19 @@ CompiledQuery compile_source(const std::string& source, const CompileOptions& op
         return result;
     }
 
-    // Cold path. A bypassed cache still compiles into the cache directory, but under a unique
-    // name, so dlopen cannot hand back an already-loaded copy.
-    const std::string stem =
-        options.use_cache ? name
-                          : name + "." + std::to_string(getpid()) + "." + std::to_string(++g_unique_counter);
-    const auto src = dir / (stem + ".cpp");
-    const auto tmp = dir / (stem + ".tmp." + library_extension());
-    const auto out = options.use_cache ? lib : dir / (stem + "." + library_extension());
+    // Cold path. Scratch files (source, compiler output, stderr) are per process and per call,
+    // so concurrent processes compiling the same key never share a file. A cached library is
+    // then renamed onto <key>.<ext>: rename is atomic, and every writer produces the same
+    // library, so the last one wins harmlessly. A bypassed cache keeps the unique name, so
+    // dlopen cannot hand back an already-loaded copy.
+    const std::string stem = name + "." + std::to_string(getpid()) + "." + std::to_string(++g_unique_counter);
+    const auto        src  = dir / (stem + ".cpp");
+    const auto        tmp  = dir / (stem + ".tmp." + library_extension());
+    const auto        out  = options.use_cache ? lib : dir / (stem + "." + library_extension());
     {
         std::ofstream file{src};
         file << source;
+        file.close();
         if (!file) throw CodegenError("cannot write " + src.string());
     }
 
@@ -233,6 +235,8 @@ CompiledQuery compile_source(const std::string& source, const CompileOptions& op
     std::error_code ec;
     std::filesystem::rename(tmp, out, ec);  // atomic: a reader never sees a half-written library
     if (ec) throw CodegenError("cannot move " + tmp.string() + " to " + out.string() + ": " + ec.message());
+    std::filesystem::remove(src, ec);  // kept only when compilation fails, for debugging
+    std::filesystem::remove(src.string() + ".err", ec);
 
     start                = Clock::now();
     result.fn            = load(out);
