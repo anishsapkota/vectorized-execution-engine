@@ -26,9 +26,12 @@ BENCH_SRC := src/tools/bench.cpp $(LIB_SRC)
 BENCH_OBJ := $(BENCH_SRC:.cpp=.o)
 BENCH_BIN := wb_bench
 
+CODEGEN_SRC := src/tools/codegen_bench.cpp $(LIB_SRC)
+CODEGEN_BIN := wb_codegen
+
 .PHONY: all test bench clean
 
-all: $(BIN) $(GEN_BIN) $(DIST_BIN) $(BENCH_BIN)
+all: $(BIN) $(GEN_BIN) $(DIST_BIN) $(BENCH_BIN) $(CODEGEN_BIN)
 
 $(BIN): $(OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
@@ -40,6 +43,9 @@ $(DIST_BIN): $(DIST_SRC:.cpp=.o)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BENCH_BIN): $(BENCH_OBJ)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(CODEGEN_BIN): $(CODEGEN_SRC:.cpp=.o)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 data/readings.csv: $(GEN_BIN)
@@ -57,8 +63,8 @@ $(TEST_BIN): $(TEST_OBJ)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
--include $(OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(DIST_SRC:.cpp=.d) $(GEN_SRC:.cpp=.d) $(BENCH_SRC:.cpp=.d)
+-include $(OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(DIST_SRC:.cpp=.d) $(GEN_SRC:.cpp=.d) $(BENCH_SRC:.cpp=.d) $(CODEGEN_SRC:.cpp=.d)
 
 clean:
-	rm -f $(OBJ) $(TEST_OBJ) src/tools/*.o $(BIN) $(TEST_BIN) $(GEN_BIN) $(DIST_BIN) $(BENCH_BIN)
+	rm -f $(OBJ) $(TEST_OBJ) src/tools/*.o $(BIN) $(TEST_BIN) $(GEN_BIN) $(DIST_BIN) $(BENCH_BIN) $(CODEGEN_BIN)
 	find src tests -name "*.d" -delete

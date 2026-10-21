@@ -260,3 +260,79 @@ same sanitizers as the host.
   drift; the duplication is limited to `runtime.h`.
 - **macOS-specific `.dylib` naming.** The compiler module selects the extension per platform
   (`.so` on Linux).
+
+## 11. Results (2026-10-21)
+
+Setup:
+
+- Apple M3 Pro, Apple clang 21, single-threaded, best of 7 runs.
+- Data: readings 10M rows (153 segments); orders 2M; customers 100k.
+- Raw output: `bench/results/codegen.txt`.
+- Every query matched bit for bit across all three engines.
+
+| Query | vec ms | cg-O1 ms | cg-O3 ms | cg-O3 speedup | Prediction | Verdict |
+|---|---|---|---|---|---|---|
+| Q1 ts > mid | 5.2 | 4.4 | 5.3 | 0.99× (1.0–1.5× across runs) | ≈ equal | **confirmed** |
+| Q2 value > 50 | 6.8 | 12.8 | 13.7 | 0.49× | vectorized wins or ties | **confirmed**, for a different reason |
+| Q3 value > 50 AND device_id < 5000 | 7.2 | 33.7 | 35.3 | 0.20× | codegen wins | **refuted** |
+| Q4 group by device_id | 17.7 | 20.2 | 17.9 | 0.99× | codegen slightly ahead | **refuted** (tie at -O3) |
+| Q5 join + group by region | 23.1 | 13.4 | 12.4 | 1.86× | codegen clearly ahead | **confirmed** |
+
+One-off cost per cold query:
+
+- generate under 0.1 ms;
+- compile 45–93 ms;
+- load 155–230 ms.
+
+Loading costs more than compiling. The first `dlopen` of a newly written `.dylib` takes about
+155 ms; re-opening the same cached file in a later process takes 0.25–0.87 ms (measured). That is
+consistent with macOS checking each new library on first load, but the cause is not confirmed. Break-even (runs needed to
+repay generate + compile + load) is 23–24 runs for Q5 and 263 runs for Q1 at -O1; it never
+arrives for Q2–Q4.
+
+**Q1, roughly equal.** Pruning leaves about 5M rows in both engines, and both run one predictable
+compare per row (ts is sorted) followed by a serial floating-point add. Run-to-run noise
+(±1 ms) is larger than the gap between the engines.
+
+**Q2, vectorized wins: the cause is if-conversion, not misprediction.** In the assembly of the
+generated loop, clang removed the branch:
+
+```
+fcmp; cinc; fcsel
+```
+
+Every one of the 10M rows therefore runs an `fadd` that feeds the next row, a serial dependency
+chain at about 4 cycles per add (≈ 11 ms). The vectorized engine first writes a branchless
+selection vector, then adds only the 5M survivors.
+
+**Q3, the largest miss.** The generated loop keeps a real `b.le` on `value > 50`, about 50%
+unpredictable. The reason is HyPer-style lazy loading: `device_id` is decoded only after the first
+predicate passes, so the compiler will not hoist that load above the branch, and the loop cannot be
+if-converted. A throwaway probe isolated the first predicate as the cost:
+
+| Variant | vec ms | cg ms |
+|---|---|---|
+| Q3 as written | 7.9 | 37.0 |
+| first predicate always true | 12.1 | 13.7 |
+| second predicate always true | 8.8 | 35.3 |
+| both always true | 13.8 | 13.7 |
+
+The vectorized engine's branchless selection vectors pay off exactly where Kersten et al. found
+vectorization wins: selective predicates on unsorted data.
+
+**Q4, a tie.** Both engines are bound by hash-table probes (the same AggTable algorithm, 10k groups,
+Zipf-skewed keys). Codegen's per-row decode and update cost about the same as the vectorized
+engine's batched loop over borrowed spans. -O1 is 14% slower than -O3 here.
+
+**Q5, codegen wins 1.86×.** The vectorized HashJoinOperator materializes every output row into
+owned chunks before aggregating: 31k allocations per run versus 37. The generated code keeps the
+probe value in a register and reads only the build column it needs (region) straight from the join
+table into the agg update.
+
+**What to try next.** Each item comes with the measurement that would confirm or refute it.
+
+- An eager-load mode in the generator, emitting branch-free predicate evaluation, aimed at Q2 and
+  Q3. Accepting reassociated float sums would allow SIMD reductions, but breaks the bit-identical
+  guarantee.
+- Relaxing the exact-order requirement for the comparison, to measure what it costs.
+- Code-signing or pre-warming generated libraries, to cut `load_ms`.

@@ -1,0 +1,23 @@
+readings 10000000 rows (153 segments), orders 2000000, customers 100000, iters 7, single-threaded
+Q1 SumCount(group=none,sum=1, Filter([0>1705026065], Scan(readings,[1,2])))
+Q2 SumCount(group=none,sum=0, Filter([0>50], Scan(readings,[2])))
+Q3 SumCount(group=none,sum=0, Filter([0>50,1<5000], Scan(readings,[2,0])))
+Q4 SumCount(group=0,sum=1, Scan(readings,[0,2]))
+Q5 SumCount(group=3,sum=1, HashJoin(0=0, Filter([1>50], Scan(orders,[0,1])), Scan(customers,[0,1])))
+
+q   engine    gen ms compile ms  load ms    best ms  median ms  speedup break-even    allocs match
+Q1  vec            -          -        -       5.23       5.48    1.00x          -        12     -
+Q1  cg-O1       0.05       47.8   158.28       4.44       5.54    1.18x        263        13   yes
+Q1  cg-O3       0.03       57.6   229.00       5.26       6.51    0.99x        inf        13   yes
+Q2  vec            -          -        -       6.78       7.21    1.00x          -        10     -
+Q2  cg-O1       0.02       44.8   156.61      12.84      13.67    0.53x        inf        14   yes
+Q2  cg-O3       0.02       45.4   211.97      13.73      15.06    0.49x        inf        14   yes
+Q3  vec            -          -        -       7.22       7.30    1.00x          -        15     -
+Q3  cg-O1       0.03       44.9   155.32      33.70      35.59    0.21x        inf        14   yes
+Q3  cg-O3       0.02       47.0   215.65      35.26      35.98    0.20x        inf        14   yes
+Q4  vec            -          -        -      17.68      18.09    1.00x          -        72     -
+Q4  cg-O1       0.02       48.6   221.04      20.22      20.33    0.87x        inf        61   yes
+Q4  cg-O3       0.03       50.6   159.62      17.85      18.39    0.99x        inf        61   yes
+Q5  vec            -          -        -      23.08      23.61    1.00x          -     30990     -
+Q5  cg-O1       0.03       64.5   160.49      13.35      13.84    1.73x         23        37   yes
+Q5  cg-O3       0.04       92.5   159.71      12.41      14.08    1.86x         24        37   yes
