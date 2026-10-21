@@ -1,0 +1,13 @@
+# Build outputs
+*.o
+*.d
+/wb
+/wb_gen
+/wb_bench
+/wb_test
+/wb_dist
+/wb_codegen
+
+# Generated data and codegen cache
+/data/readings.csv
+/.wb_cache/
