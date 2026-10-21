@@ -43,7 +43,7 @@ CODEGEN_BIN := wb_codegen
 MEM_SRC := src/tools/mem_probe.cpp $(LIB_SRC)
 MEM_BIN := wb_mem
 
-.PHONY: all test bench clean
+.PHONY: all test bench clean lint fix-includes install-hooks
 
 all: $(BIN) $(GEN_BIN) $(DIST_BIN) $(BENCH_BIN) $(CODEGEN_BIN) $(MEM_BIN)
 
@@ -73,6 +73,17 @@ bench: $(BENCH_BIN) data/readings.csv
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
+
+# Unused #includes (clang-tidy misc-include-cleaner, see .clang-tidy and tools/fix_includes.sh).
+lint:
+	tools/fix_includes.sh --check
+
+fix-includes:
+	tools/fix_includes.sh --test
+
+# Runs tools/git-hooks/pre-commit on every commit: removes unused includes from staged files.
+install-hooks:
+	git config core.hooksPath tools/git-hooks
 
 $(TEST_BIN): $(TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)

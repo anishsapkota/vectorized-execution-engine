@@ -1,0 +1,21 @@
+#!/bin/sh
+# Removes unused #includes from the staged C++ files under src/ and tests/, rebuilds, and re-stages
+# them (tools/fix_includes.sh). Install with `make install-hooks`; skip once with --no-verify.
+#
+# A staged file that also has unstaged edits is not touched (re-staging it would sweep those
+# edits into the commit); the commit is aborted instead.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+files=$(git diff --cached --name-only --diff-filter=ACM -- 'src/*.cpp' 'src/*.h' 'tests/*.cpp' 'tests/*.h')
+[ -n "$files" ] || exit 0
+
+for f in $files; do
+    if ! git diff --quiet -- "$f"; then
+        echo "pre-commit: $f has unstaged changes; stage it fully (git add $f) or commit with --no-verify" >&2
+        exit 1
+    fi
+done
+
+tools/fix_includes.sh $files
+git add $files

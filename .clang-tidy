@@ -1,0 +1,13 @@
+# Lint configuration, used by tools/fix_includes.sh (make lint / make fix-includes, the pre-commit
+# hook) and by clangd in the editor.
+#
+# Only unused #includes are reported and removed; MissingIncludes is off, so the tool never asks
+# to add includes. IgnoreHeaders lists umbrella headers that the include cleaner misreports as
+# unused because their symbols come from sub-headers (removing them breaks the build).
+Checks: '-*,misc-include-cleaner'
+WarningsAsErrors: ''
+CheckOptions:
+  - key: misc-include-cleaner.MissingIncludes
+    value: false
+  - key: misc-include-cleaner.IgnoreHeaders
+    value: 'mach/mach\.h'
