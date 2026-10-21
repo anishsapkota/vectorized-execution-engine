@@ -2,7 +2,6 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <utility>

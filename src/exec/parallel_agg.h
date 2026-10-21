@@ -1,6 +1,5 @@
 #pragma once
 #include <cstddef>
-#include <memory>
 
 #include "exec/hash_table.h"
 #include "storage/table.h"

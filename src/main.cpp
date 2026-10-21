@@ -1,9 +1,7 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
-#include <queue>
 #include <thread>
-#include <tuple>
 #include <vector>
 
 #include "exec/filter.h"

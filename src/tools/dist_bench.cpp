@@ -3,10 +3,8 @@
 //   ./wb_dist [--nodes N] [--slices S] [--orders ROWS] [--customers ROWS] [--skew EXP]
 //             [--experiment all|strategies|skew|crossover]
 
-#include <cmath>
 #include <cstdio>
 #include <iostream>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -14,8 +12,6 @@
 #include "dist/dist_join.h"
 #include "dist/distribute.h"
 #include "dist/planner.h"
-#include "storage/segment.h"
-#include "storage/table.h"
 #include "todo.h"
 #include "tools/datagen.h"
 

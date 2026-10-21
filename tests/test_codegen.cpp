@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
-#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -23,7 +22,6 @@
 #include "codegen/runtime.h"
 #include "exec/group_slots.h"
 #include "exec/median_store.h"
-#include "exec/hash_table.h"
 #include "plan/lower_vec.h"
 #include "plan/plan.h"
 #include "storage/segment.h"

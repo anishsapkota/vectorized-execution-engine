@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>

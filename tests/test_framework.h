@@ -1,9 +1,9 @@
 #pragma once
 
 #include <functional>
-#include <sstream>
+#include <sstream>  // IWYU pragma: keep (used by the CHECK/CHECK_EQ macros)
 #include <stdexcept>
-#include <string>
+#include <string>  // IWYU pragma: keep (used by the CHECK/CHECK_EQ macros)
 #include <vector>
 
 // A deliberately tiny test harness: TEST registers a function, CHECK/CHECK_EQ throw on failure.

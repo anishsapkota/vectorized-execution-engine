@@ -11,7 +11,6 @@
 #include <utility>
 #include <vector>
 
-#include "dist/chunk.h"
 #include "exec/operator.h"
 #include "exec/scan.h"
 #include "storage/segment.h"
