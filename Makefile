@@ -1,6 +1,10 @@
 CXX := g++
-CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -O3 -march=native -g -Isrc -pthread -MMD -MP
+CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -O3 -march=native -g -Isrc -pthread -MMD -MP \
+            -DWB_SRC_DIR=\"$(CURDIR)/src\"
 LDFLAGS :=
+ifneq ($(shell uname),Darwin)
+LDFLAGS += -ldl
+endif
 
 LIB_SRC := $(wildcard src/storage/*.cpp) $(wildcard src/exec/*.cpp) $(wildcard src/dist/*.cpp) \
            $(wildcard src/plan/*.cpp) $(wildcard src/codegen/*.cpp)

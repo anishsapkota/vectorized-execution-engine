@@ -1,16 +1,69 @@
 // Compiled engine: runtime header, compiler/cache, generator, and differential tests against the
 // vectorized engine (results must be bit-identical).
 
+#include <unistd.h>
+
 #include <bit>
+#include <cstdlib>
+#include <fstream>
+#include <string>
 #include <cstdint>
 #include <map>
 #include <vector>
 
+#include "codegen/compiler.h"
 #include "codegen/runtime.h"
 #include "exec/hash_table.h"
 #include "test_framework.h"
 
 using namespace wb;
+using namespace wb::codegen;
+
+namespace {
+
+// Points the codegen cache at a fresh directory for the rest of the test.
+std::string fresh_cache_dir() {
+    char tmpl[] = "/tmp/wb_codegen_test_XXXXXX";
+    const char* dir = mkdtemp(tmpl);
+    if (!dir) throw wbtest::TestFailure("mkdtemp failed");
+    setenv("WB_CODEGEN_CACHE", dir, 1);
+    unsetenv("WB_CXX");
+    return dir;
+}
+
+// A hand-written "generated" library. `tag` makes each source (and so its cache key) unique.
+std::string test_source(const std::string& tag, int abi_version = -1) {
+    const std::string version =
+        abi_version < 0 ? "wb_rt::kAbiVersion" : std::to_string(abi_version) + "u";
+    return "// " + tag + "\n#include \"codegen/runtime.h\"\n"
+           "extern \"C\" uint32_t wb_abi_version() { return " + version + "; }\n"
+           "extern \"C\" int wb_query(const wb_rt::QueryInput*, wb_rt::QueryOutput* out) {\n"
+           "    out->emit_group(out->ctx, 7, 1.5, 2);\n    return 0;\n}\n";
+}
+
+struct Emitted {
+    int64_t key   = 0;
+    double  sum   = 0;
+    int64_t count = 0;
+    int     calls = 0;
+};
+
+void record_group(void* ctx, int64_t key, double sum, int64_t count) {
+    auto* e = static_cast<Emitted*>(ctx);
+    *e      = {key, sum, count, e->calls + 1};
+}
+
+template <typename F>
+std::string codegen_error_text(F&& f) {
+    try {
+        f();
+    } catch (const CodegenError& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
 
 TEST(runtime_hash_matches_engine) {
     std::vector<int64_t> keys{INT64_MIN, INT64_MAX, -1, 0, 1};
@@ -82,4 +135,62 @@ TEST(runtime_join_matches_engine) {
     empty.finalize();
     CHECK(empty.find(0) == nullptr);
     empty.release();
+}
+
+TEST(compile_and_call) {
+    fresh_cache_dir();
+    const auto     compiled = compile_source(test_source("compile_and_call"), {});
+    Emitted        emitted;
+    wb_rt::QueryOutput out{&emitted, record_group};
+    CHECK_EQ(compiled.fn(nullptr, &out), 0);
+    CHECK_EQ(emitted.calls, 1);
+    CHECK_EQ(emitted.key, int64_t{7});
+    CHECK_EQ(emitted.sum, 1.5);
+    CHECK_EQ(emitted.count, int64_t{2});
+    CHECK(!compiled.stats.cache_hit);
+    CHECK(compiled.stats.compile_ms > 0.0);
+}
+
+TEST(compile_cache_hit) {
+    fresh_cache_dir();
+    const auto src = test_source("compile_cache_hit");
+    compile_source(src, {});
+    const std::size_t before = compiler_invocations();
+    const auto        again  = compile_source(src, {});
+    CHECK(again.stats.cache_hit);
+    CHECK_EQ(compiler_invocations(), before);
+}
+
+TEST(compile_missing_compiler_raises) {
+    fresh_cache_dir();
+    setenv("WB_CXX", "/nonexistent", 1);
+    const auto text = codegen_error_text([] { compile_source(test_source("missing_compiler"), {}); });
+    unsetenv("WB_CXX");
+    CHECK(text.find("/nonexistent") != std::string::npos);
+}
+
+TEST(compile_abi_mismatch_raises) {
+    fresh_cache_dir();
+    const auto text = codegen_error_text([] { compile_source(test_source("abi", 999), {}); });
+    CHECK(text.find("999") != std::string::npos);
+}
+
+TEST(corrupt_cached_library_raises) {
+    const auto dir = fresh_cache_dir();
+    const auto src = test_source("corrupt_cache");
+    char       name[32];
+    std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(cache_key(src, {})));
+    std::ofstream{dir + "/" + name + "." + library_extension()} << "not a library";
+    const auto text = codegen_error_text([&] { compile_source(src, {}); });
+    CHECK(!text.empty());
+}
+
+TEST(cache_key_depends_on_opt_level) {
+    const auto src = test_source("key_opt");
+    CHECK(cache_key(src, {.opt_level = 1}) != cache_key(src, {.opt_level = 3}));
+}
+
+TEST(cache_key_depends_on_runtime_header) {
+    const auto src = test_source("key_runtime");
+    CHECK(cache_key(src, {}, "a") != cache_key(src, {}, "b"));
 }
