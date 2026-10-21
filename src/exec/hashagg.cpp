@@ -1,12 +1,12 @@
 #include "exec/hashagg.h"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
-#include <functional>
-#include <stdexcept>
+#include <cstring>
+#include <new>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "exec/batch.h"
 #include "storage/vector.h"
@@ -47,6 +47,24 @@ void for_each_double(const Vector& col, const Rows& rows, F&& f) {
     });
 }
 
+// Float-stored column values without widening (MEDIAN keeps the storage type).
+template <typename Rows, typename F>
+void for_each_float(const Vector& col, const Rows& rows, F&& f) {
+    static_cast<const Float64Vector&>(col).visit([&](auto values) {
+        if constexpr (std::is_same_v<typename decltype(values)::element_type, const float>) {
+            for (std::size_t k = 0; k < rows.size(); ++k)
+                f(k, values[rows[k]]);
+        } else {
+            throw std::logic_error("HashAggOperator: MEDIAN column changed storage between batches");
+        }
+    });
+}
+
+template <typename T>
+T& at(std::byte* state, std::size_t offset) {
+    return *reinterpret_cast<T*>(state + offset);
+}
+
 template <typename T>
 void update_min(T& m, T v) {
     if (v < m || v != v) m = v;
@@ -57,14 +75,47 @@ void update_max(T& m, T v) {
     if (v > m || v != v) m = v;
 }
 
+bool is_int128(const AggSpec& s) {
+    return (s.kind == AggKind::Sum || s.kind == AggKind::Avg) && s.type == DataType::Int64;
+}
+
 }  // namespace
 
 HashAggOperator::HashAggOperator(std::unique_ptr<Operator> child, std::optional<std::size_t> group_col,
                                  std::vector<AggSpec> aggs)
     : child_(std::move(child)),
       group_col_(group_col) {
-    for (const AggSpec& spec : aggs) {
-        states_.push_back(State{spec, {}, {}, {}, {}, {}, {}});
+    for (const AggSpec& spec : aggs)
+        fields_.push_back(Field{spec, 0, false, {}});
+
+    // State layout: __int128 fields (16-aligned), count, 8-byte fields, MEDIAN handles.
+    std::size_t offset = 0;
+    for (Field& f : fields_) {
+        if (!is_int128(f.spec)) continue;
+        f.offset = offset;
+        offset += 16;
+        state_align_ = 16;
+    }
+    count_offset_ = offset;
+    offset += 8;
+    for (Field& f : fields_) {
+        if (f.spec.kind == AggKind::Count || f.spec.kind == AggKind::Median || is_int128(f.spec)) continue;
+        f.offset = offset;
+        offset += 8;
+    }
+    for (Field& f : fields_) {
+        if (f.spec.kind != AggKind::Median) continue;
+        f.offset = offset;
+        offset += sizeof(MedianHandle);
+    }
+    state_bytes_ = offset;
+
+    if (group_col_) {
+        slots_.emplace(state_bytes_, state_align_);
+    } else {
+        global_state_raw_.resize(state_bytes_ + 16);
+        const auto addr = reinterpret_cast<std::uintptr_t>(global_state_raw_.data());
+        global_state_   = global_state_raw_.data() + ((16 - addr % 16) % 16);
     }
 }
 
@@ -72,72 +123,102 @@ HashAggOperator::HashAggOperator(std::unique_ptr<Operator> child, std::size_t gr
     : HashAggOperator(std::move(child), group_col,
                       {AggSpec{AggKind::Sum, agg_col, DataType::Float64}, AggSpec{AggKind::Count}}) {}
 
-void HashAggOperator::add_group_(const Batch& batch, std::uint32_t row) {
-    counts_.push_back(0);
-    for (State& s : states_) {
-        const AggSpec& spec = s.spec;
-        if (spec.kind == AggKind::Count) continue;
-        const bool is_int = spec.type == DataType::Int64;
-        if (spec.kind == AggKind::Sum || spec.kind == AggKind::Avg) {
-            if (is_int) s.i128.push_back(0);
-            else s.f64.push_back(0.0);  // +0.0; the first row is added like every other
-        } else if (is_int) {            // Min/Max start at the group's first value
-            s.i64.push_back(static_cast<const Int64Vector&>(batch.column(spec.col)).value(row));
+void HashAggOperator::bind_median_stores_(const Batch& batch) {
+    for (Field& f : fields_) {
+        if (f.spec.kind != AggKind::Median) continue;
+        if (f.spec.type == DataType::Int64) {
+            f.store.emplace<MedianStore<int64_t>>();
         } else {
-            s.f64.push_back(static_cast<const Float64Vector&>(batch.column(spec.col)).value(row));
+            f.narrow = static_cast<const Float64Vector&>(batch.column(f.spec.col)).narrow();
+            if (f.narrow) f.store.emplace<MedianStore<float>>();
+            else f.store.emplace<MedianStore<double>>();
+        }
+    }
+    stores_bound_ = true;
+}
+
+void HashAggOperator::init_state_(std::byte* state, const Batch& batch, std::uint32_t row) {
+    at<int64_t>(state, count_offset_) = 0;
+    for (const Field& f : fields_) {
+        const AggSpec& spec = f.spec;
+        switch (spec.kind) {
+            case AggKind::Count:
+                break;
+            case AggKind::Sum:
+            case AggKind::Avg:
+                if (is_int128(spec)) at<__int128>(state, f.offset) = 0;
+                else at<double>(state, f.offset) = 0.0;  // +0.0; the first row is added like every other
+                break;
+            case AggKind::Min:
+            case AggKind::Max:  // start at the group's first value
+                if (spec.type == DataType::Int64) {
+                    at<int64_t>(state, f.offset) = static_cast<const Int64Vector&>(batch.column(spec.col)).value(row);
+                } else {
+                    at<double>(state, f.offset) = static_cast<const Float64Vector&>(batch.column(spec.col)).value(row);
+                }
+                break;
+            case AggKind::Median:
+                new (state + f.offset) MedianHandle{};
+                break;
         }
     }
 }
 
 void HashAggOperator::consume_(const Batch& batch) {
+    if (!stores_bound_) bind_median_stores_(batch);
     if (batch.has_sel()) consume_rows_(batch, SelRows{batch.sel()});
     else consume_rows_(batch, RangeRows{batch.offset(), batch.size()});
 }
 
 template <typename Rows>
 void HashAggOperator::consume_rows_(const Batch& batch, const Rows& rows) {
-    if (group_col_) gids_.resize(rows.size());
-
-    // Pass 1: group ids and counts (a global aggregate is group 0).
-    if (group_col_) {
-        for_each_int(batch.column(*group_col_), rows, [&](std::size_t k, int64_t key) {
-            const std::uint32_t g = index_.find_or_insert(key);
-            if (g == counts_.size()) add_group_(batch, rows[k]);
-            ++counts_[g];
-            gids_[k] = g;
-        });
-    } else {
-        if (counts_.empty() && rows.size() > 0) add_group_(batch, rows[0]);
-        if (rows.size() > 0) counts_[0] += static_cast<int64_t>(rows.size());
-    }
-
     if (!group_col_) return consume_global_(batch, rows);
 
-    // Pass 2: one loop per aggregate; kind and type are resolved before the row loop.
-    for (State& s : states_) {
-        const AggSpec& spec = s.spec;
+    // Pass 1: each live row's state block (creating new groups) and counts. Reserving first means
+    // the table cannot rehash during the batch, so every pointer stays valid until pass 2 ends.
+    slots_->reserve(slots_->size() + rows.size());
+    ptrs_.resize(rows.size());
+    for_each_int(batch.column(*group_col_), rows, [&](std::size_t k, int64_t key) {
+        bool       fresh = false;
+        std::byte* state = slots_->find_or_insert(key, fresh);
+        if (fresh) init_state_(state, batch, rows[k]);
+        ++at<int64_t>(state, count_offset_);
+        ptrs_[k] = state;
+    });
+
+    // Pass 2: one loop per aggregate, updating the state in place.
+    const auto& ptrs = ptrs_;
+    for (Field& f : fields_) {
+        const AggSpec&    spec = f.spec;
+        const std::size_t off  = f.offset;
         if (spec.kind == AggKind::Count) continue;
-        const Vector&  col    = batch.column(spec.col);
-        const auto&    gids   = gids_;
-        const bool     is_int = spec.type == DataType::Int64;
+        const Vector& col    = batch.column(spec.col);
+        const bool    is_int = spec.type == DataType::Int64;
         switch (spec.kind) {
             case AggKind::Sum:
             case AggKind::Avg:
-                if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { s.i128[gids[k]] += v; });
-                else for_each_double(col, rows, [&](std::size_t k, double v) { s.f64[gids[k]] += v; });
+                if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { at<__int128>(ptrs[k], off) += v; });
+                else for_each_double(col, rows, [&](std::size_t k, double v) { at<double>(ptrs[k], off) += v; });
                 break;
             case AggKind::Min:
-                if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { update_min(s.i64[gids[k]], v); });
-                else for_each_double(col, rows, [&](std::size_t k, double v) { update_min(s.f64[gids[k]], v); });
+                if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { update_min(at<int64_t>(ptrs[k], off), v); });
+                else for_each_double(col, rows, [&](std::size_t k, double v) { update_min(at<double>(ptrs[k], off), v); });
                 break;
             case AggKind::Max:
-                if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { update_max(s.i64[gids[k]], v); });
-                else for_each_double(col, rows, [&](std::size_t k, double v) { update_max(s.f64[gids[k]], v); });
+                if (is_int) for_each_int(col, rows, [&](std::size_t k, int64_t v) { update_max(at<int64_t>(ptrs[k], off), v); });
+                else for_each_double(col, rows, [&](std::size_t k, double v) { update_max(at<double>(ptrs[k], off), v); });
                 break;
             case AggKind::Median:
-                s.med_gids.insert(s.med_gids.end(), gids.begin(), gids.end());
-                if (is_int) for_each_int(col, rows, [&](std::size_t, int64_t v) { s.med_i64.push_back(v); });
-                else for_each_double(col, rows, [&](std::size_t, double v) { s.med_f64.push_back(v); });
+                if (auto* s = std::get_if<MedianStore<int64_t>>(&f.store)) {
+                    for_each_int(col, rows, [&](std::size_t k, int64_t v) { s->append(at<MedianHandle>(ptrs[k], off), v); });
+                } else if (auto* d = std::get_if<MedianStore<double>>(&f.store)) {
+                    if (static_cast<const Float64Vector&>(col).narrow()) {
+                        throw std::logic_error("HashAggOperator: MEDIAN column changed storage between batches");
+                    }
+                    for_each_double(col, rows, [&](std::size_t k, double v) { d->append(at<MedianHandle>(ptrs[k], off), v); });
+                } else if (auto* fl = std::get_if<MedianStore<float>>(&f.store)) {
+                    for_each_float(col, rows, [&](std::size_t k, float v) { fl->append(at<MedianHandle>(ptrs[k], off), v); });
+                }
                 break;
             case AggKind::Count:
                 break;
@@ -145,153 +226,154 @@ void HashAggOperator::consume_rows_(const Batch& batch, const Rows& rows) {
     }
 }
 
-// Global aggregate: no group ids needed. Each aggregate accumulates in a local for the batch (a
+// Global aggregate: one state block. Each aggregate accumulates in a local for the batch (a
 // register, not a memory read-modify-write per row), in row order like the grouped path.
 template <typename Rows>
 void HashAggOperator::consume_global_(const Batch& batch, const Rows& rows) {
-    for (State& s : states_) {
-        const AggSpec& spec = s.spec;
-        if (spec.kind == AggKind::Count || rows.size() == 0) continue;
+    if (rows.size() == 0) return;
+    std::byte* state = global_state_;
+    if (!global_started_) {
+        init_state_(state, batch, rows[0]);
+        global_started_ = true;
+    }
+    at<int64_t>(state, count_offset_) += static_cast<int64_t>(rows.size());
+
+    for (Field& f : fields_) {
+        const AggSpec& spec = f.spec;
+        if (spec.kind == AggKind::Count) continue;
         const Vector& col    = batch.column(spec.col);
         const bool    is_int = spec.type == DataType::Int64;
         switch (spec.kind) {
             case AggKind::Sum:
             case AggKind::Avg:
                 if (is_int) {
-                    __int128 acc = s.i128[0];
+                    __int128 acc = at<__int128>(state, f.offset);
                     for_each_int(col, rows, [&](std::size_t, int64_t v) { acc += v; });
-                    s.i128[0] = acc;
+                    at<__int128>(state, f.offset) = acc;
                 } else {
-                    double acc = s.f64[0];
+                    double acc = at<double>(state, f.offset);
                     for_each_double(col, rows, [&](std::size_t, double v) { acc += v; });
-                    s.f64[0] = acc;
+                    at<double>(state, f.offset) = acc;
                 }
                 break;
             case AggKind::Min:
             case AggKind::Max: {
                 const bool is_min = spec.kind == AggKind::Min;
                 if (is_int) {
-                    int64_t m = s.i64[0];
+                    int64_t m = at<int64_t>(state, f.offset);
                     for_each_int(col, rows, [&](std::size_t, int64_t v) { is_min ? update_min(m, v) : update_max(m, v); });
-                    s.i64[0] = m;
+                    at<int64_t>(state, f.offset) = m;
                 } else {
-                    double m = s.f64[0];
+                    double m = at<double>(state, f.offset);
                     for_each_double(col, rows, [&](std::size_t, double v) { is_min ? update_min(m, v) : update_max(m, v); });
-                    s.f64[0] = m;
+                    at<double>(state, f.offset) = m;
                 }
                 break;
             }
-            case AggKind::Median:
-                s.med_gids.resize(s.med_gids.size() + rows.size(), 0u);
-                if (is_int) for_each_int(col, rows, [&](std::size_t, int64_t v) { s.med_i64.push_back(v); });
-                else for_each_double(col, rows, [&](std::size_t, double v) { s.med_f64.push_back(v); });
+            case AggKind::Median: {
+                MedianHandle& h = at<MedianHandle>(state, f.offset);
+                if (auto* s = std::get_if<MedianStore<int64_t>>(&f.store)) {
+                    for_each_int(col, rows, [&](std::size_t, int64_t v) { s->append(h, v); });
+                } else if (auto* d = std::get_if<MedianStore<double>>(&f.store)) {
+                    if (static_cast<const Float64Vector&>(col).narrow()) {
+                        throw std::logic_error("HashAggOperator: MEDIAN column changed storage between batches");
+                    }
+                    for_each_double(col, rows, [&](std::size_t, double v) { d->append(h, v); });
+                } else if (auto* fl = std::get_if<MedianStore<float>>(&f.store)) {
+                    for_each_float(col, rows, [&](std::size_t, float v) { fl->append(h, v); });
+                }
                 break;
+            }
             case AggKind::Count:
                 break;
         }
     }
 }
 
-namespace {
-
-// MEDIAN's total order (shared with the codegen runtime): numbers ascending with -0.0 before
-// +0.0, then NaNs ordered by bit pattern. Values `<` cannot tell apart (signed zeros, NaN
-// payloads) get a fixed position, so the median does not depend on the selection algorithm.
-bool less_nan_last(double a, double b) {
-    const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
-    if (a_nan || b_nan) return !a_nan || (b_nan && std::bit_cast<uint64_t>(a) < std::bit_cast<uint64_t>(b));
-    return a < b || (a == b && std::signbit(a) && !std::signbit(b));
-}
-
-// Median of values[begin, end) (non-empty); reorders the range.
-template <typename T, typename Less>
-double median_of(T* begin, T* end, Less less) {
-    const std::size_t n   = static_cast<std::size_t>(end - begin);
-    T*                mid = begin + n / 2;
-    std::nth_element(begin, mid, end, less);
-    if (n % 2) return static_cast<double>(*mid);
-    const T lo = *std::max_element(begin, mid, less);  // everything left of mid is <= *mid
-    return (static_cast<double>(lo) + static_cast<double>(*mid)) / 2.0;
-}
-
-template <typename T, typename Less>
-std::vector<double> group_medians(const std::vector<std::uint32_t>& gids, const std::vector<T>& values,
-                                  const std::vector<int64_t>& counts, Less less) {
-    // Counting sort by group: every row of a group contributed exactly one value.
-    std::vector<std::size_t> start(counts.size() + 1, 0);
-    for (std::size_t g = 0; g < counts.size(); ++g)
-        start[g + 1] = start[g] + static_cast<std::size_t>(counts[g]);
-    std::vector<T>           bucketed(values.size());
-    std::vector<std::size_t> next(start.begin(), start.end() - 1);
-    for (std::size_t i = 0; i < values.size(); ++i)
-        bucketed[next[gids[i]]++] = values[i];
-
-    std::vector<double> out(counts.size());
-    for (std::size_t g = 0; g < counts.size(); ++g)
-        out[g] = median_of(bucketed.data() + start[g], bucketed.data() + start[g + 1], less);
-    return out;
-}
-
-}  // namespace
-
-std::vector<double> HashAggOperator::medians_(State& s) const {
-    std::vector<double> out = s.spec.type == DataType::Int64
-                                  ? group_medians(s.med_gids, s.med_i64, counts_, std::less<int64_t>{})
-                                  : group_medians(s.med_gids, s.med_f64, counts_, less_nan_last);
-    s.med_gids = {};
-    s.med_i64  = {};
-    s.med_f64  = {};
-    return out;
-}
-
 void HashAggOperator::make_output_() {
-    const std::size_t groups = counts_.size();
+    const std::size_t groups = group_col_ ? slots_->size() : (global_started_ ? 1 : 0);
+    auto              state  = [&](std::uint32_t g) { return group_col_ ? slots_->state_of(g) : global_state_; };
+    auto              key    = [&](std::uint32_t g) {
+        return group_col_ ? std::to_string(slots_->key_of(g)) : std::string{"global"};
+    };
+    out_rows_ = groups;
+
     if (group_col_) {
         std::vector<int64_t> keys(groups);
         for (std::uint32_t g = 0; g < groups; ++g)
-            keys[g] = index_.key_of(g);
+            keys[g] = slots_->key_of(g);
         out_vecs_.push_back(std::make_unique<Int64Vector>(keys));
     }
-    for (State& s : states_) {
-        const AggSpec& spec   = s.spec;
-        const bool     is_int = spec.type == DataType::Int64;
+    for (Field& f : fields_) {
+        const AggSpec&    spec   = f.spec;
+        const std::size_t off    = f.offset;
+        const bool        is_int = spec.type == DataType::Int64;
         switch (spec.kind) {
-            case AggKind::Count:
-                out_vecs_.push_back(std::make_unique<Int64Vector>(counts_));
+            case AggKind::Count: {
+                std::vector<int64_t> counts(groups);
+                for (std::uint32_t g = 0; g < groups; ++g)
+                    counts[g] = at<int64_t>(state(g), count_offset_);
+                out_vecs_.push_back(std::make_unique<Int64Vector>(counts));
                 break;
+            }
             case AggKind::Sum:
                 if (is_int) {
                     std::vector<int64_t> sums(groups);
                     for (std::uint32_t g = 0; g < groups; ++g) {
-                        if (s.i128[g] > INT64_MAX || s.i128[g] < INT64_MIN) {
-                            throw std::overflow_error(
-                                "SUM overflow in group " +
-                                (group_col_ ? std::to_string(index_.key_of(g)) : std::string{"global"}));
-                        }
-                        sums[g] = static_cast<int64_t>(s.i128[g]);
+                        const __int128 s = at<__int128>(state(g), off);
+                        if (s > INT64_MAX || s < INT64_MIN) throw std::overflow_error("SUM overflow in group " + key(g));
+                        sums[g] = static_cast<int64_t>(s);
                     }
                     out_vecs_.push_back(std::make_unique<Int64Vector>(sums));
                 } else {
-                    out_vecs_.push_back(std::make_unique<Float64Vector>(s.f64));
+                    std::vector<double> sums(groups);
+                    for (std::uint32_t g = 0; g < groups; ++g)
+                        sums[g] = at<double>(state(g), off);
+                    out_vecs_.push_back(std::make_unique<Float64Vector>(std::move(sums)));
                 }
                 break;
             case AggKind::Avg: {
                 std::vector<double> avg(groups);
                 for (std::uint32_t g = 0; g < groups; ++g) {
-                    const double n = static_cast<double>(counts_[g]);
-                    avg[g]         = is_int ? static_cast<double>(s.i128[g]) / n : s.f64[g] / n;
+                    const double n = static_cast<double>(at<int64_t>(state(g), count_offset_));
+                    avg[g] = is_int ? static_cast<double>(at<__int128>(state(g), off)) / n : at<double>(state(g), off) / n;
                 }
                 out_vecs_.push_back(std::make_unique<Float64Vector>(std::move(avg)));
                 break;
             }
             case AggKind::Min:
             case AggKind::Max:
-                if (is_int) out_vecs_.push_back(std::make_unique<Int64Vector>(s.i64));
-                else out_vecs_.push_back(std::make_unique<Float64Vector>(s.f64));
+                if (is_int) {
+                    std::vector<int64_t> v(groups);
+                    for (std::uint32_t g = 0; g < groups; ++g)
+                        v[g] = at<int64_t>(state(g), off);
+                    out_vecs_.push_back(std::make_unique<Int64Vector>(v));
+                } else {
+                    std::vector<double> v(groups);
+                    for (std::uint32_t g = 0; g < groups; ++g)
+                        v[g] = at<double>(state(g), off);
+                    out_vecs_.push_back(std::make_unique<Float64Vector>(std::move(v)));
+                }
                 break;
-            case AggKind::Median:
-                out_vecs_.push_back(std::make_unique<Float64Vector>(medians_(s)));
+            case AggKind::Median: {
+                std::vector<double> med(groups);
+                std::visit(
+                    [&](auto& store) {
+                        using S = std::decay_t<decltype(store)>;
+                        if constexpr (!std::is_same_v<S, std::monostate>) {
+                            if (!group_col_) {
+                                if (groups) med[0] = store.finalize_single(at<MedianHandle>(state(0), off));
+                                return;
+                            }
+                            std::vector<typename S::value_type> scratch;
+                            for (std::uint32_t g = 0; g < groups; ++g)
+                                med[g] = store.finalize_group(at<MedianHandle>(state(g), off), scratch);
+                        }
+                    },
+                    f.store);
+                out_vecs_.push_back(std::make_unique<Float64Vector>(std::move(med)));
                 break;
+            }
         }
     }
     for (const auto& v : out_vecs_)
@@ -307,10 +389,8 @@ void HashAggOperator::build_() {
 
 std::optional<Batch> HashAggOperator::next() {
     if (!built_) build_();
-
-    const std::size_t total = counts_.size();
-    if (emit_cursor_ >= total) return std::nullopt;
-    const std::size_t batch_size = std::min(static_cast<std::size_t>(emit_batch_size_), total - emit_cursor_);
+    if (emit_cursor_ >= out_rows_) return std::nullopt;
+    const std::size_t batch_size = std::min(static_cast<std::size_t>(emit_batch_size_), out_rows_ - emit_cursor_);
     const auto        offset     = static_cast<std::uint32_t>(emit_cursor_);
     emit_cursor_ += batch_size;
     return Batch{out_cols_, offset, static_cast<std::uint32_t>(batch_size)};

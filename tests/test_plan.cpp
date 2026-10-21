@@ -746,7 +746,7 @@ TEST(median_store_matches_sort) {
     check_median_store_matches_sort<int64_t>();
 }
 
-TEST(median_store_global_frees_chunks) {
+TEST(median_store_global_selects_in_place_and_releases) {
     MedianStore<double> store;
     MedianHandle        h;
     std::vector<double> values;
@@ -760,4 +760,37 @@ TEST(median_store_global_frees_chunks) {
     const double got = store.finalize_single(h);
     CHECK_EQ(store.bytes_reserved(), std::size_t{0});
     CHECK_EQ(std::bit_cast<uint64_t>(got), std::bit_cast<uint64_t>(sorted_median(values)));
+}
+
+TEST(vec_batch_of_all_new_groups) {
+    std::vector<std::pair<int64_t, double>> rows;
+    for (int64_t i = 0; i < 50'000; ++i)
+        rows.emplace_back((i * 2'654'435'761) % 1'000'003, 0.5 * static_cast<double>(i));
+    auto t = make_kv_double(rows, 4'096);
+    check_matches_reference(*aggregate(scan(*t, {0, 1}), 0,
+                                       {{AggFn::Count, std::nullopt}, {AggFn::Sum, 1}, {AggFn::Min, 1}, {AggFn::Median, 1}}));
+}
+
+TEST(vec_median_block_boundaries) {
+    auto t = make_kv_double(median_boundary_rows(), 300);
+    check_matches_reference(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(vec_int64_min_key_with_median) {
+    auto t = make_kv_double(int64_min_median_rows(), 128);
+    check_matches_reference(
+        *aggregate(scan(*t, {0, 1}), 0, {{AggFn::Sum, 1}, {AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(vec_median_narrow_float) {
+    auto t = make_readings(50'000, 8'000, /*narrow_float=*/true);
+    check_matches_reference(*aggregate(scan(*t, {0, 2}), 0, {{AggFn::Median, 1}}));
+    check_matches_reference(*aggregate(scan(*t, {2}), std::nullopt, {{AggFn::Median, 0}}));
+}
+
+TEST(vec_many_int128_fields) {
+    auto t = make_readings(50'000);
+    check_matches_reference(*aggregate(scan(*t, {0, 1, 2}), 0,
+                                       {{AggFn::Sum, 0}, {AggFn::Avg, 0}, {AggFn::Sum, 1}, {AggFn::Min, 2},
+                                        {AggFn::Count, std::nullopt}}));
 }

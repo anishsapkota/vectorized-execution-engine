@@ -185,6 +185,27 @@ inline std::vector<std::pair<int64_t, double>> signed_zero_median_rows() {
             {4, nan_b}, {4, 1.0}, {4, nan_a}, {4, nan_b}, {4, nan_a}, {4, 2.0}};  // even: (nan_a + nan_a) / 2
 }
 
+// MEDIAN groups of 1, 255, 256, 257 and 512 values: chains ending at, just after and well past a
+// 256-value block boundary.
+inline std::vector<std::pair<int64_t, double>> median_boundary_rows() {
+    std::vector<std::pair<int64_t, double>> rows;
+    uint64_t state = 17;
+    for (int64_t g : {1, 255, 256, 257, 512})
+        for (int64_t i = 0; i < g; ++i) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            rows.emplace_back(g, static_cast<double>(state >> 40) / 512.0);
+        }
+    return rows;
+}
+
+// Keys alternate between INT64_MIN (held outside the hash table's slot array) and 0.
+inline std::vector<std::pair<int64_t, double>> int64_min_median_rows() {
+    std::vector<std::pair<int64_t, double>> rows;
+    for (int64_t i = 0; i < 1'000; ++i)
+        rows.emplace_back(i % 2 ? INT64_MIN : 0, 0.25 * static_cast<double>(i % 37) - 3.0);
+    return rows;
+}
+
 inline KeyValueRows int64_extreme_rows() { return {{1, INT64_MIN}, {1, INT64_MAX}}; }
 
 }  // namespace wbtest
