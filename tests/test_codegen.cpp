@@ -160,6 +160,20 @@ TEST(runtime_agg_matches_engine) {
     rt.release();
 }
 
+TEST(runtime_agg_int64_min_key) {
+    wb_rt::AggTable rt;
+    rt.init();
+    for (int i = 0; i < 3; ++i)
+        ++rt.find_or_insert(INT64_MIN).count;
+    for (int i = 0; i < 2; ++i)
+        ++rt.find_or_insert(0).count;
+    std::map<int64_t, int64_t> counts;
+    rt.for_each([&](const wb_rt::AggSlot& s) { counts[s.key] += s.count; });
+    CHECK_EQ(rt.size, std::size_t{2});
+    CHECK(counts == (std::map<int64_t, int64_t>{{INT64_MIN, 3}, {0, 2}}));
+    rt.release();
+}
+
 TEST(runtime_join_matches_engine) {
     // Payload column 0 = insertion index, column 1 = a double, to check bit-exact storage.
     wb_rt::JoinTable jt;
@@ -277,7 +291,7 @@ TEST(cg_extreme_keys) {
     fresh_cache_dir();
     Schema schema{{"k", DataType::Int64}, {"v", DataType::Float64}};
     Table  t{"extreme", schema};
-    const std::vector<int64_t> wide{INT64_MIN + 1, INT64_MAX, -1, 0, -9'000'000'000'000LL, 42};
+    const std::vector<int64_t> wide{INT64_MIN, INT64_MIN + 1, INT64_MAX, -1, 0, -9'000'000'000'000LL, 42};
     std::size_t                rows = 0;
     for (int seg = 0; seg < 4; ++seg) {
         SegmentBuilder b{schema};

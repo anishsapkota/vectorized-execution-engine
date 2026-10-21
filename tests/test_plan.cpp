@@ -263,3 +263,17 @@ TEST(empty_table_vec) {
     CHECK_EQ(global.sums[0], 0.0);
     CHECK_EQ(run_vectorized(*sum_count(scan(*t, {0, 2}), 0, 1)).num_rows(), std::size_t{0});
 }
+
+TEST(vec_int64_min_group_key) {
+    // INT64_MIN is the hash tables' empty-slot marker; as a real key it must still be its own
+    // group, and must not leak into whichever key next probes the same slot.
+    Schema schema{{"k", DataType::Int64}, {"v", DataType::Float64}};
+    Table  t{"t", schema};
+    SegmentBuilder b{schema};
+    for (int i = 0; i < 100; ++i) {
+        b.append_int64(0, i % 3 == 0 ? INT64_MIN : i % 5);
+        b.append_float64(1, static_cast<double>(i));
+    }
+    t.add_segment(b.seal(std::nullopt, 1024));
+    check_matches_reference(*sum_count(scan(t, {0, 1}), 0, 1));
+}

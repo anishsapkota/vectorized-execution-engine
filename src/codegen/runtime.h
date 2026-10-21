@@ -16,7 +16,7 @@
 namespace wb_rt {
 
 // Bump on any change to the structs below; the host rejects libraries built against another.
-constexpr uint32_t kAbiVersion = 1;
+constexpr uint32_t kAbiVersion = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Inputs and outputs
@@ -73,8 +73,12 @@ struct AggTable {
     static constexpr int64_t kEmpty = INT64_MIN;
 
     AggSlot* slots    = nullptr;
-    size_t   size     = 0;
+    size_t   size     = 0;  // live keys, including the INT64_MIN key if present
     size_t   capacity = 0;  // power of two
+
+    // INT64_MIN is the empty-slot marker, so that key lives outside the slot array.
+    bool    has_min  = false;
+    AggSlot min_slot = {kEmpty, 0.0, 0};
 
     void init(size_t initial = 1024) {
         size_t cap = 1;
@@ -84,6 +88,13 @@ struct AggTable {
     }
 
     AggSlot& find_or_insert(int64_t key) {
+        if (key == kEmpty) {
+            if (!has_min) {
+                has_min = true;
+                ++size;
+            }
+            return min_slot;
+        }
         if (size * 2 >= capacity) grow_();
         const size_t mask = capacity - 1;
         for (size_t i = hash64(key) & mask;; i = (i + 1) & mask) {
@@ -99,6 +110,7 @@ struct AggTable {
 
     template <class F>
     void for_each(F&& f) const {
+        if (has_min) f(min_slot);
         for (size_t i = 0; i < capacity; ++i)
             if (slots[i].key != kEmpty) f(slots[i]);
     }
@@ -108,6 +120,8 @@ struct AggTable {
         slots    = nullptr;
         size     = 0;
         capacity = 0;
+        has_min  = false;
+        min_slot = AggSlot{kEmpty, 0.0, 0};
     }
 
    private:
@@ -123,6 +137,7 @@ struct AggTable {
         AggSlot*     old     = slots;
         const size_t old_cap = capacity;
         allocate_(old_cap * 2);
+        size = has_min ? 1 : 0;  // the INT64_MIN key is not in the slot array
         for (size_t i = 0; i < old_cap; ++i) {
             if (old[i].key == kEmpty) continue;
             AggSlot& s = find_or_insert(old[i].key);

@@ -11,6 +11,13 @@ AggHashTable::AggHashTable(std::size_t initial_capacity) {
 }
 
 AggHashTable::Value& AggHashTable::find_or_insert(int64_t key) {
+    if (key == kEmptyKey) {
+        if (!has_min_key_) {
+            has_min_key_ = true;
+            ++size_;
+        }
+        return min_key_value_;
+    }
     if (size_ * 2 >= capacity_) {
         resize_(capacity_ * 2);
     }
@@ -39,7 +46,7 @@ void AggHashTable::resize_(std::size_t new_capacity) {
     std::vector<Slot> old = std::move(slots_);
     slots_.assign(new_capacity, Slot{});  // all kEmptyKey
     capacity_ = new_capacity;
-    size_     = 0;
+    size_     = has_min_key_ ? 1 : 0;  // the INT64_MIN key is not in the slot array
 
     for (const auto& slot : old) {
         if (slot.key != kEmptyKey) {
