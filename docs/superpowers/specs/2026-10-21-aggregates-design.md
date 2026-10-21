@@ -246,13 +246,9 @@ step is a counting sort plus a per-group selection, with the same complexity in 
 (`std::nth_element` in one, the runtime's three-way quickselect in the other), so the execution
 model barely matters.
 
-MEDIAN memory for 10M rows (computed, not measured):
-
-- payload: 4 B gid plus 8 B value collected per input row, plus 8 B per row for the bucketed
-  copy at finalize, so 20 B per row;
-- buffers grow by doubling, so capacity rounds 10M up to about 16.8M, and old and new buffers
-  coexist during the last grow. The realistic peak is about 28–30 B per row, roughly
-  280–300 MB transient for Q7.
+MEDIAN memory for 10M rows: **measured 382 MiB (40 B/row)** peak for Q7 before the footprint
+fixes. The earlier "about 280–300 MB" estimate ignored allocator behaviour. After the fixes it is
+89 MiB (Q7) and 76 MiB (Q8); see `2026-10-21-footprint-fixes-design.md` §7.
 
 **Q9.** The same cause as Q5: the vectorized join materializes every output row into chunks
 (31k allocations per run, against 72) before the aggregate sees it.

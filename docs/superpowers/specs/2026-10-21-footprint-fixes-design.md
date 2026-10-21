@@ -182,3 +182,69 @@ this spec.
   negligible.
 - `reset_plain`/`reset` weaken column immutability for one operator; contained by documentation and
   the existing Batch lifetime contract.
+
+## 7. Results (2026-10-21)
+
+Setup: Apple M3 Pro, single-threaded, best of 7 runs, 10M-row readings, 2M orders, 100k customers.
+Raw output: `bench/results/mem-before.txt`, `mem-after.txt`, `codegen.txt` and
+`after-footprint.txt`. All 18 compiled rows in `wb_codegen` still match the vectorized engine bit
+for bit, and the suite (111 tests, including ASan+UBSan over the generated libraries) passes.
+
+### Targets
+
+| Target | Before | After | Result |
+|---|---|---|---|
+| Q7 MEDIAN peak, vec / cg | 382.9 / 383.3 MiB (40.2 B/row) | **89.0 / 88.8 MiB** (9.3 B/row) | met (≤ 100) |
+| Q8 MEDIAN peak, vec / cg | 381.3 / 381.9 MiB | **75.9 / 75.8 MiB** (8.0 B/row) | met (≤ 80) |
+| Q7 on `narrow_float`, vec / cg | 380.3 / 382.6 MiB | **51.2 / 50.5 MiB** | met (≈ half of Q7) |
+| Q4 grouped SUM/COUNT, cg-O3 | 25.4 ms | **12.4 ms** | met (≤ ~18) |
+| Q4 grouped SUM/COUNT, vec | 26.8 ms | 28.8 ms | **missed** |
+| Q5 / Q9 vectorized allocations per run | ~31,000 | 301 / 397 | **missed** (≤ 100) |
+
+**Q4 vectorized: missed, and slightly worse.** Phase probe of the vectorized operator: pass 1
+alone (find each row's state, count) takes 21.2 ms; the per-aggregate SUM pass adds about 7 ms;
+the old fused `AggHashTable` loop takes 18.9 ms (measured). Inline state helps a fused per-row
+loop: the generated code is 2.33× faster than the vectorized engine. It does not help per-aggregate
+passes, which read better from a dense state array (the 80 KB sum array stayed cache-resident)
+than from state spread across a 1 MiB slot table. The review's premise, that the slot → gid → state
+hop was the main cost, was right for the compiled engine and wrong for the vectorized one.
+
+**Join allocations: missed, but per-batch allocation is gone.** At a quarter of the data, Q5 still
+makes 294 allocations (against 301), so what remains is a fixed per-query cost: build-side
+materialization, the aggregate's tables and operator setup. The per-batch output allocations
+(~31k) are eliminated. Q9's count grows with data only through MEDIAN chunks (128 KiB each).
+
+### Effect on the experiment (timings, cg-O3 against vec)
+
+| Query | vec before → after | cg before → after | cg speedup after |
+|---|---|---|---|
+| Q4 group by | 26.8 → 28.8 ms | 25.4 → 12.4 ms | **2.33×** (was 1.05×) |
+| Q5 join + group | 21.8 → **11.5 ms** | 12.9 → 12.4 ms | **0.93×** (was 1.68×) |
+| Q6 min/max/avg/count | 38.1 → 41.3 ms | 32.5 → 20.6 ms | **2.00×** (was 1.17×) |
+| Q7 median by group | 149.3 → 158.8 ms | 136.4 → 130.8 ms | 1.21× |
+| Q8 global median | 67.3 → 69.8 ms | 64.1 → 63.3 ms | 1.10× |
+| Q9 join + avg/median | 33.7 → 23.0 ms | 23.1 → 26.2 ms | **0.88×** (was 1.46×) |
+
+Two earlier conclusions change:
+
+- **Joins.** The compiled engine's 1.7× win on Q5 (and 1.5× on Q9) was mostly the vectorized
+  join's per-batch materialization, not the execution model. With reused output columns the
+  vectorized join is as fast or faster.
+- **Grouped aggregation.** With state inline in the hash slot, the compiled engine is now about 2×
+  faster on Q4 and Q6. The fused per-row update touches one cache line per row; the vectorized
+  engine's per-aggregate passes cannot exploit that layout.
+
+### Deviations from §3
+
+- The global MEDIAN is selected in place over its block chain (three-way quickselect through an
+  index accessor) instead of being copied into an exact-size array while chunks are freed. On this
+  allocator, freeing ~128 KiB chunks does not lower the process footprint (standalone repro:
+  162 MiB with and without freeing), so the copy alone kept Q8 at 161.5 MiB.
+- Blocks hold exactly 2 KiB of values (256 int64/double or 512 float) with their next/size headers
+  in side arrays. 256-value blocks with inline headers spilled each 128 KiB chunk into an extra
+  16 KiB page (Q8 85.2 MiB), and 255-value blocks made in-place indexing a division
+  (Q8 67 → 88 ms).
+
+The `wb_bench` checksums are unchanged except "groupby device MT": that total varies between runs
+(…0325672 / …03256726) because the parallel merge order depends on thread scheduling. That path
+was not touched by this work.
