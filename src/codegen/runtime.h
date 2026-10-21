@@ -16,7 +16,7 @@
 namespace wb_rt {
 
 // Bump on any change to the structs below; the host rejects libraries built against another.
-constexpr uint32_t kAbiVersion = 2;
+constexpr uint32_t kAbiVersion = 3;
 
 // ---------------------------------------------------------------------------------------------
 // Inputs and outputs
@@ -45,9 +45,13 @@ struct QueryInput {
     uint32_t         num_scans;
 };
 
+// Results leave as rows: one 64-bit pattern per output column (int64 as is, double bit-copied).
+// On SUM(INT64) overflow wb_query sets error_key (or error_global) and returns 3.
 struct QueryOutput {
-    void* ctx;
-    void (*emit_group)(void* ctx, int64_t key, double sum, int64_t count);
+    void*   ctx;
+    void    (*emit_row)(void* ctx, const uint64_t* values, uint32_t n);
+    int64_t error_key;
+    uint8_t error_global;
 };
 
 inline uint32_t width_code(uint8_t width) {
@@ -60,25 +64,27 @@ inline uint32_t width_code(uint8_t width) {
 inline uint64_t hash64(int64_t key) { return static_cast<uint64_t>(key) * 0x9E3779B97F4A7C15ULL; }
 
 // ---------------------------------------------------------------------------------------------
-// Aggregation table: same algorithm as wb::AggHashTable
+// Group table: same algorithm as wb::GroupIndex. Maps a key to a dense group id in first-seen
+// order; per-group state lives in a StateRows indexed by that id.
 // ---------------------------------------------------------------------------------------------
 
-struct AggSlot {
-    int64_t key;
-    double  sum;
-    int64_t count;
-};
-
-struct AggTable {
+struct GroupTable {
     static constexpr int64_t kEmpty = INT64_MIN;
 
-    AggSlot* slots    = nullptr;
-    size_t   size     = 0;  // live keys, including the INT64_MIN key if present
+    struct Slot {
+        int64_t  key;
+        uint32_t gid;
+    };
+
+    Slot*    slots    = nullptr;
     size_t   capacity = 0;  // power of two
+    int64_t* keys     = nullptr;  // gid -> key
+    uint32_t count    = 0;        // groups, including the INT64_MIN key if present
+    uint32_t keys_cap = 0;
 
     // INT64_MIN is the empty-slot marker, so that key lives outside the slot array.
-    bool    has_min  = false;
-    AggSlot min_slot = {kEmpty, 0.0, 0};
+    bool     has_min = false;
+    uint32_t min_gid = 0;
 
     void init(size_t initial = 1024) {
         size_t cap = 1;
@@ -87,64 +93,193 @@ struct AggTable {
         allocate_(cap);
     }
 
-    AggSlot& find_or_insert(int64_t key) {
+    uint32_t size() const { return count; }
+    int64_t  key_of(uint32_t gid) const { return keys[gid]; }
+
+    uint32_t find_or_insert(int64_t key) {
         if (key == kEmpty) {
             if (!has_min) {
                 has_min = true;
-                ++size;
+                min_gid = push_key_(key);
             }
-            return min_slot;
+            return min_gid;
         }
-        if (size * 2 >= capacity) grow_();
+        if (static_cast<size_t>(count) * 2 >= capacity) grow_();
         const size_t mask = capacity - 1;
         for (size_t i = hash64(key) & mask;; i = (i + 1) & mask) {
-            AggSlot& s = slots[i];
-            if (s.key == key) return s;
+            Slot& s = slots[i];
+            if (s.key == key) return s.gid;
             if (s.key == kEmpty) {
-                s.key = key;
-                ++size;
-                return s;
+                s = Slot{key, push_key_(key)};
+                return s.gid;
             }
         }
-    }
-
-    template <class F>
-    void for_each(F&& f) const {
-        if (has_min) f(min_slot);
-        for (size_t i = 0; i < capacity; ++i)
-            if (slots[i].key != kEmpty) f(slots[i]);
     }
 
     void release() {
         __builtin_free(slots);
-        slots    = nullptr;
-        size     = 0;
-        capacity = 0;
-        has_min  = false;
-        min_slot = AggSlot{kEmpty, 0.0, 0};
+        __builtin_free(keys);
+        *this = GroupTable{};
     }
 
    private:
     void allocate_(size_t cap) {
-        slots    = static_cast<AggSlot*>(__builtin_malloc(cap * sizeof(AggSlot)));
+        slots    = static_cast<Slot*>(__builtin_malloc(cap * sizeof(Slot)));
         capacity = cap;
-        size     = 0;
         for (size_t i = 0; i < cap; ++i)
-            slots[i] = AggSlot{kEmpty, 0.0, 0};
+            slots[i] = Slot{kEmpty, 0};
+    }
+
+    uint32_t push_key_(int64_t key) {
+        if (count == keys_cap) {
+            keys_cap      = keys_cap ? keys_cap * 2 : 1024;
+            auto* grown   = static_cast<int64_t*>(__builtin_malloc(keys_cap * sizeof(int64_t)));
+            if (count) __builtin_memcpy(grown, keys, count * sizeof(int64_t));
+            __builtin_free(keys);
+            keys = grown;
+        }
+        keys[count] = key;
+        return count++;
     }
 
     void grow_() {
-        AggSlot*     old     = slots;
+        Slot*        old     = slots;
         const size_t old_cap = capacity;
         allocate_(old_cap * 2);
-        size = has_min ? 1 : 0;  // the INT64_MIN key is not in the slot array
+        const size_t mask = capacity - 1;
         for (size_t i = 0; i < old_cap; ++i) {
             if (old[i].key == kEmpty) continue;
-            AggSlot& s = find_or_insert(old[i].key);
-            s.sum      = old[i].sum;
-            s.count    = old[i].count;
+            size_t j = hash64(old[i].key) & mask;
+            while (slots[j].key != kEmpty)
+                j = (j + 1) & mask;
+            slots[j] = old[i];
         }
         __builtin_free(old);
+    }
+};
+
+// Growable array of per-group state records. Row is defined by the generated code.
+template <class Row>
+struct StateRows {
+    Row*     data     = nullptr;
+    uint32_t size     = 0;
+    uint32_t capacity = 0;
+
+    Row& push(const Row& row) {
+        if (size == capacity) {
+            capacity    = capacity ? capacity * 2 : 1024;
+            auto* grown = static_cast<Row*>(__builtin_malloc(capacity * sizeof(Row)));
+            if (size) __builtin_memcpy(grown, data, size * sizeof(Row));
+            __builtin_free(data);
+            data = grown;
+        }
+        data[size] = row;
+        return data[size++];
+    }
+
+    void release() {
+        __builtin_free(data);
+        *this = StateRows{};
+    }
+};
+
+// ---------------------------------------------------------------------------------------------
+// Exact median: collects (group id, value) pairs, then per group selects the middle value(s).
+// Ordering puts NaN after every number, matching the vectorized engine; an even count averages
+// the two middle values in double.
+// ---------------------------------------------------------------------------------------------
+
+inline bool median_less(int64_t a, int64_t b) { return a < b; }
+inline bool median_less(double a, double b) { return a == a && (b != b || a < b); }
+
+template <class T>
+struct MedianBuffer {
+    uint32_t* gids     = nullptr;
+    T*        values   = nullptr;
+    size_t    size     = 0;
+    size_t    capacity = 0;
+
+    void append(uint32_t gid, T v) {
+        if (size == capacity) grow_();
+        gids[size]   = gid;
+        values[size] = v;
+        ++size;
+    }
+
+    // counts[g] = number of values appended for group g; writes each group's median to out[g].
+    void finalize(const int64_t* counts, uint32_t groups, double* out) {
+        size_t* start = static_cast<size_t*>(__builtin_malloc((static_cast<size_t>(groups) + 1) * sizeof(size_t)));
+        size_t* next  = static_cast<size_t*>(__builtin_malloc((static_cast<size_t>(groups) + 1) * sizeof(size_t)));
+        start[0]      = 0;
+        for (uint32_t g = 0; g < groups; ++g)
+            start[g + 1] = start[g] + static_cast<size_t>(counts[g]);
+        for (uint32_t g = 0; g < groups; ++g)
+            next[g] = start[g];
+        T* bucketed = static_cast<T*>(__builtin_malloc((size ? size : 1) * sizeof(T)));
+        for (size_t i = 0; i < size; ++i)
+            bucketed[next[gids[i]]++] = values[i];
+        for (uint32_t g = 0; g < groups; ++g)
+            out[g] = median_(bucketed + start[g], start[g + 1] - start[g]);
+        __builtin_free(bucketed);
+        __builtin_free(next);
+        __builtin_free(start);
+    }
+
+    void release() {
+        __builtin_free(gids);
+        __builtin_free(values);
+        *this = MedianBuffer{};
+    }
+
+   private:
+    void grow_() {
+        capacity          = capacity ? capacity * 2 : 4096;
+        auto* new_gids    = static_cast<uint32_t*>(__builtin_malloc(capacity * sizeof(uint32_t)));
+        auto* new_values  = static_cast<T*>(__builtin_malloc(capacity * sizeof(T)));
+        if (size) {
+            __builtin_memcpy(new_gids, gids, size * sizeof(uint32_t));
+            __builtin_memcpy(new_values, values, size * sizeof(T));
+        }
+        __builtin_free(gids);
+        __builtin_free(values);
+        gids   = new_gids;
+        values = new_values;
+    }
+
+    // Quickselect with three-way partitioning: afterwards a[k] holds the k-th smallest value and
+    // every element before k is <= it.
+    static void select_(T* a, size_t n, size_t k) {
+        size_t lo = 0, hi = n;  // active range [lo, hi)
+        while (hi - lo > 1) {
+            const T pivot = a[lo + (hi - lo) / 2];
+            size_t  lt = lo, i = lo, gt = hi;  // [lo,lt) < pivot, [lt,i) == pivot, [gt,hi) > pivot
+            while (i < gt) {
+                if (median_less(a[i], pivot)) {
+                    const T t = a[lt];
+                    a[lt++]   = a[i];
+                    a[i++]    = t;
+                } else if (median_less(pivot, a[i])) {
+                    const T t = a[--gt];
+                    a[gt]     = a[i];
+                    a[i]      = t;
+                } else {
+                    ++i;
+                }
+            }
+            if (k < lt) hi = lt;
+            else if (k >= gt) lo = gt;
+            else return;  // a[k] equals the pivot
+        }
+    }
+
+    static double median_(T* a, size_t n) {
+        const size_t k = n / 2;
+        select_(a, n, k);
+        if (n % 2) return static_cast<double>(a[k]);
+        T lo = a[0];
+        for (size_t i = 1; i < k; ++i)
+            if (median_less(lo, a[i])) lo = a[i];
+        return (static_cast<double>(lo) + static_cast<double>(a[k])) / 2.0;
     }
 };
 

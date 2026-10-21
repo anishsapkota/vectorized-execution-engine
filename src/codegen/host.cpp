@@ -1,5 +1,6 @@
 #include "codegen/host.h"
 
+#include <bit>
 #include <chrono>
 
 #include "exec/predicate.h"
@@ -65,10 +66,14 @@ struct Collector {
     const plan::Aggregate*  agg;
 };
 
-void collect_group(void* ctx, int64_t key, double sum, int64_t count) {
-    auto*       c = static_cast<Collector*>(ctx);
-    std::size_t i = 0;
-    if (c->result->grouped) c->result->columns[i++].push_int(key);
+// Rows arrive as [key,] sum, count (the generator's current SUM/COUNT state).
+void collect_row(void* ctx, const uint64_t* values, uint32_t) {
+    auto*       c     = static_cast<Collector*>(ctx);
+    std::size_t v     = 0;
+    std::size_t i     = 0;
+    if (c->result->grouped) c->result->columns[i++].push_int(static_cast<int64_t>(values[v++]));
+    const double  sum   = std::bit_cast<double>(values[v++]);
+    const int64_t count = static_cast<int64_t>(values[v]);
     for (const plan::AggExpr& e : c->agg->aggs) {
         auto& col = c->result->columns[i++];
         if (e.fn == plan::AggFn::Count) col.push_int(count);
@@ -106,7 +111,7 @@ plan::QueryResult execute(const PreparedQuery& query) {
     for (std::size_t i = result.grouped ? 1 : 0; i < types.size(); ++i)
         result.columns.push_back({types[i], {}, {}, {}});
     Collector          collector{&result, &agg};
-    wb_rt::QueryOutput out{&collector, collect_group};
+    wb_rt::QueryOutput out{&collector, collect_row, 0, 0};
     const int          rc = query.compiled.fn(&bound.input, &out);
     if (rc == 1) throw CodegenError("codegen: a segment's width signature was not compiled (stale library?)");
     if (rc != 0) throw CodegenError("codegen: wb_query failed with code " + std::to_string(rc));

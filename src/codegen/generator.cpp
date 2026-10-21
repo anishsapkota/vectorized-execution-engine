@@ -283,7 +283,9 @@ class Generator {
             const std::string key = ctx[*agg.group_col].get();
             const std::string val = ctx[sum_col_].get();
             cur().body.open("{");
-            cur().body.line("wb_rt::AggSlot& e = st.agg.find_or_insert(" + key + ");");
+            cur().body.line("const uint32_t g = st.groups.find_or_insert(" + key + ");");
+            cur().body.line("if (g == st.rows.size) st.rows.push(Row{0, 0.0});");
+            cur().body.line("Row& e = st.rows.data[g];");
             cur().body.line("e.sum += " + val + ";");
             cur().body.line("++e.count;");
             cur().body.close();
@@ -310,10 +312,16 @@ class Generator {
         w.line("");
         w.open("namespace {");
         w.line("");
+        w.open("struct Row {");
+        w.line("int64_t count;");
+        w.line("double sum;");
+        w.close("};");
+        w.line("");
         w.open("struct State {");
         w.line("double sum = 0.0;");
         w.line("int64_t count = 0;");
-        w.line("wb_rt::AggTable agg;");
+        w.line("wb_rt::GroupTable groups;");
+        w.line("wb_rt::StateRows<Row> rows;");
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
             w.line("wb_rt::JoinTable jt" + std::to_string(id) + ";");
         w.close("};");
@@ -328,7 +336,7 @@ class Generator {
         w.open("extern \"C\" int wb_query(const wb_rt::QueryInput* in, wb_rt::QueryOutput* out) {");
         w.line("if (in->num_scans != " + std::to_string(scans_.size()) + "u) return 2;");
         w.line("State st;");
-        if (grouped_) w.line("st.agg.init();");
+        if (grouped_) w.line("st.groups.init();");
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
             w.line("st.jt" + std::to_string(id) + ".init(" + std::to_string(join_cols_[id]) + "u);");
         w.line("int rc = 0;");
@@ -340,12 +348,20 @@ class Generator {
         }
         w.open("if (rc == 0) {");
         if (grouped_) {
-            w.line("st.agg.for_each([&](const wb_rt::AggSlot& s) { out->emit_group(out->ctx, s.key, s.sum, s.count); });");
+            w.open("for (uint32_t g = 0; g < st.rows.size; ++g) {");
+            w.line("const Row& r = st.rows.data[g];");
+            w.line("const uint64_t row[3] = {static_cast<uint64_t>(st.groups.key_of(g)), __builtin_bit_cast(uint64_t, r.sum), static_cast<uint64_t>(r.count)};");
+            w.line("out->emit_row(out->ctx, row, 3);");
+            w.close();
         } else {
-            w.line("out->emit_group(out->ctx, 0, st.sum, st.count);");
+            w.line("const uint64_t row[2] = {__builtin_bit_cast(uint64_t, st.sum), static_cast<uint64_t>(st.count)};");
+            w.line("out->emit_row(out->ctx, row, 2);");
         }
         w.close();
-        if (grouped_) w.line("st.agg.release();");
+        if (grouped_) {
+            w.line("st.groups.release();");
+            w.line("st.rows.release();");
+        }
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
             w.line("st.jt" + std::to_string(id) + ".release();");
         w.line("return rc;");
