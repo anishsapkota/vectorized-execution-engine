@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "exec/group_index.h"
+#include "exec/group_slots.h"
 #include "exec/parallel_agg.h"
 #include "plan/lower_vec.h"
 #include "plan/plan.h"
@@ -610,4 +611,60 @@ TEST(vec_median_signed_zeros_and_nan_payloads) {
     const auto r = run_vectorized(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}}));
     CHECK_EQ(std::bit_cast<uint64_t>(r.double_at(1, 0)), std::bit_cast<uint64_t>(+0.0));
     CHECK_EQ(std::bit_cast<uint64_t>(r.double_at(1, 1)), std::bit_cast<uint64_t>(-0.0 + +0.0));
+}
+
+TEST(group_slots_dense_first_seen) {
+    GroupSlots            slots{8, 8};
+    std::vector<uint32_t> gids;
+    bool                  fresh = false;
+    for (int64_t k : {int64_t{7}, int64_t{-3}, int64_t{7}, INT64_MIN, int64_t{-3}, int64_t{0}}) {
+        std::byte* state = slots.find_or_insert(k, fresh);
+        if (fresh) *reinterpret_cast<int64_t*>(state) = static_cast<int64_t>(slots.size() - 1);
+        gids.push_back(static_cast<uint32_t>(*reinterpret_cast<int64_t*>(state)));
+    }
+    CHECK(gids == (std::vector<uint32_t>{0, 1, 0, 2, 1, 3}));
+    CHECK_EQ(slots.size(), uint32_t{4});
+    CHECK_EQ(slots.key_of(2), INT64_MIN);
+}
+
+TEST(group_slots_growth_preserves_state) {
+    GroupSlots slots{8, 8};
+    bool       fresh = false;
+    for (int64_t i = 0; i < 5'000; ++i) {
+        std::byte* state = slots.find_or_insert(i * 7'919, fresh);
+        CHECK(fresh);
+        *reinterpret_cast<int64_t*>(state) = i;
+    }
+    CHECK(slots.capacity() >= 2 * static_cast<std::size_t>(slots.size()));
+    for (uint32_t gid = 0; gid < slots.size(); ++gid)
+        CHECK_EQ(*reinterpret_cast<const int64_t*>(slots.state_of(gid)), static_cast<int64_t>(gid));
+    for (int64_t i = 0; i < 5'000; ++i) {
+        std::byte* state = slots.find_or_insert(i * 7'919, fresh);
+        CHECK(!fresh);
+        CHECK_EQ(*reinterpret_cast<int64_t*>(state), i);
+    }
+}
+
+TEST(group_slots_reserve_keeps_pointers) {
+    GroupSlots slots{16, 8};
+    bool       fresh = false;
+    for (int64_t i = 0; i < 100; ++i)
+        slots.find_or_insert(i, fresh);
+    slots.reserve(slots.size() + 4'096);
+    std::vector<std::pair<uint32_t, std::byte*>> taken;
+    for (int64_t i = 100; i < 100 + 4'096; ++i) {
+        std::byte* state = slots.find_or_insert(i * 31, fresh);
+        CHECK(fresh);
+        taken.emplace_back(slots.size() - 1, state);
+    }
+    for (const auto& [gid, ptr] : taken)
+        CHECK(slots.state_of(gid) == ptr);
+}
+
+TEST(group_slots_int128_alignment) {
+    GroupSlots slots{48, 16};
+    bool       fresh = false;
+    for (int64_t k = 0; k < 1'000; ++k)
+        CHECK_EQ(reinterpret_cast<uintptr_t>(slots.find_or_insert(k * 13, fresh)) % 16, uintptr_t{0});
+    CHECK_EQ(reinterpret_cast<uintptr_t>(slots.find_or_insert(INT64_MIN, fresh)) % 16, uintptr_t{0});
 }
