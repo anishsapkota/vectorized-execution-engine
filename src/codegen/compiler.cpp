@@ -89,8 +89,18 @@ std::filesystem::path cache_dir() {
         std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
                                      std::filesystem::perm_options::replace, ec);
     }
-    if (!std::filesystem::is_directory(dir)) {
+    struct stat st {};
+    if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
         throw CodegenError("codegen cache directory " + dir.string() + " cannot be created");
+    }
+    // Every library found here is dlopen'ed into this process: refuse a directory someone else
+    // could have written to.
+    if (st.st_uid != getuid()) {
+        throw CodegenError("codegen cache directory " + dir.string() + " is not owned by the current user");
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        throw CodegenError("codegen cache directory " + dir.string() +
+                           " is writable by group or others; chmod 700 it or set WB_CODEGEN_CACHE");
     }
     return dir;
 }

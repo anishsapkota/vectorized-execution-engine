@@ -415,3 +415,13 @@ TEST(concurrent_processes_share_cache) {
     }
     CHECK_EQ(failures, 0);
 }
+
+TEST(cache_dir_writable_by_others_is_rejected) {
+    // Libraries in the cache are dlopen'ed, so a directory others can write to is code injection.
+    const auto dir = fresh_cache_dir();
+    chmod(dir.c_str(), 0777);
+    const auto text = codegen_error_text([] { compile_source(test_source("shared_cache_dir"), {}); });
+    chmod(dir.c_str(), 0700);
+    CHECK(text.find("writable") != std::string::npos);
+    CHECK(text.find(dir) != std::string::npos);
+}
