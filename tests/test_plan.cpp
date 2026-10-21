@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <bit>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "exec/group_index.h"
+#include "exec/parallel_agg.h"
 #include "plan/lower_vec.h"
 #include "plan/plan.h"
 #include "plan/result.h"
@@ -21,6 +23,7 @@
 using namespace wb;
 using namespace wb::plan;
 using wbtest::make_readings;
+using namespace wbtest;
 
 namespace {
 
@@ -474,4 +477,81 @@ TEST(group_index_growth_keeps_ids) {
         CHECK_EQ(index.find_or_insert(i * 7'919), static_cast<uint32_t>(i));
     CHECK_EQ(index.size(), uint32_t{5'000});
     CHECK(index.capacity() >= 2 * static_cast<std::size_t>(index.size()));
+}
+
+namespace {
+const std::vector<AggExpr> kDecomposable{{AggFn::Count, std::nullopt}, {AggFn::Sum, 2}, {AggFn::Sum, 0},
+                                         {AggFn::Min, 2},              {AggFn::Max, 2}, {AggFn::Min, 1},
+                                         {AggFn::Max, 1},              {AggFn::Avg, 2}, {AggFn::Avg, 0}};
+
+template <typename F>
+std::string overflow_text(F&& f) {
+    try {
+        f();
+    } catch (const std::overflow_error& e) {
+        return e.what();
+    }
+    return "";
+}
+}  // namespace
+
+TEST(vec_all_decomposable_aggs) {
+    auto t = make_readings(50'000);
+    check_matches_reference(*aggregate(scan(*t, {0, 1, 2}), 0, kDecomposable));
+    check_matches_reference(*aggregate(scan(*t, {0, 1, 2}), std::nullopt, kDecomposable));
+}
+
+TEST(vec_min_max_nan) {
+    auto t = make_nan_table();
+    const auto q = aggregate(scan(*t, {0, 1}), 0, {{AggFn::Min, 1}, {AggFn::Max, 1}});
+    check_matches_reference(*q);
+    const auto r = run_vectorized(*q);  // rows sorted by key: groups 1, 2, 3, 4
+    for (std::size_t row = 0; row < 3; ++row) {
+        CHECK(std::isnan(r.double_at(1, row)));
+        CHECK(std::isnan(r.double_at(2, row)));
+    }
+}
+
+TEST(vec_sum_negative_zero) {
+    auto       t = make_nan_table();
+    const auto q = aggregate(scan(*t, {0, 1}), 0, {{AggFn::Sum, 1}});
+    check_matches_reference(*q);
+    CHECK_EQ(std::bit_cast<uint64_t>(run_vectorized(*q).double_at(1, 3)), std::bit_cast<uint64_t>(0.0));
+}
+
+TEST(vec_sum_int128_intermediate) {
+    auto       t = make_table("t", int128_intermediate_rows());
+    const auto q = aggregate(scan(*t, {0, 1}), 0, {{AggFn::Sum, 1}, {AggFn::Avg, 1}});
+    check_matches_reference(*q);
+    CHECK_EQ(run_vectorized(*q).int_at(1, 0), int64_t{5});
+}
+
+TEST(vec_sum_int64_overflow_throws) {
+    auto t = make_table("t", overflow_rows());
+    CHECK(overflow_text([&] { run_vectorized(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Sum, 1}})); }).find("42") !=
+          std::string::npos);
+    CHECK(overflow_text([&] { run_vectorized(*aggregate(scan(*t, {0, 1}), std::nullopt, {{AggFn::Sum, 1}})); })
+              .find("global") != std::string::npos);
+}
+
+TEST(vec_aggs_above_join) {
+    auto t = make_join_tables(3'000, [](int64_t i) { return i % 400; }, 900, [](int64_t i) { return 200 + i % 300; });
+    check_matches_reference(*aggregate(join(scan(t->probe, {0, 1}), scan(t->build, {0, 1}), 0, 0), 3,
+                                       {{AggFn::Min, 1}, {AggFn::Max, 1}, {AggFn::Avg, 1}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(vec_group_sums_match_agg_hash_table) {
+    // The generalized HashAggOperator must reproduce the per-group sums the old SUM/COUNT path
+    // produced bit for bit; one-worker parallel_group_sum_count still uses that AggHashTable path.
+    auto       t   = make_readings(100'000);
+    const auto got = run_vectorized(*sum_count(scan(*t, {0, 1, 2}), 0, 2));
+    const AggHashTable old = parallel_group_sum_count(*t, 0, 2, 1);
+    std::map<int64_t, AggHashTable::Value> want;
+    old.for_each([&](int64_t k, const AggHashTable::Value& v) { want[k] = v; });
+    CHECK_EQ(got.num_rows(), want.size());
+    for (std::size_t row = 0; row < got.num_rows(); ++row) {
+        const auto& w = want.at(got.int_at(0, row));
+        CHECK_EQ(std::bit_cast<uint64_t>(got.double_at(1, row)), std::bit_cast<uint64_t>(w.sum));
+        CHECK_EQ(got.int_at(2, row), w.count);
+    }
 }

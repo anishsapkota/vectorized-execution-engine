@@ -9,7 +9,7 @@ GroupIndex::GroupIndex(std::size_t initial_capacity) {
     slots_.assign(cap, Slot{});
 }
 
-uint32_t GroupIndex::find_or_insert(int64_t key) {
+uint32_t GroupIndex::insert_(int64_t key) {
     if (key == kEmptyKey) {
         if (!has_min_key_) {
             has_min_key_ = true;

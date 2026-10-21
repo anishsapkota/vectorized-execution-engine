@@ -4,6 +4,7 @@
 
 #include "exec/filter.h"
 #include "exec/hash_join.h"
+#include "exec/agg_spec.h"
 #include "exec/hashagg.h"
 #include "exec/scan.h"
 
@@ -12,6 +13,14 @@ namespace wb::plan {
 namespace {
 
 constexpr std::uint32_t kBatchSize = 4096;
+
+static_assert(static_cast<int>(AggFn::Count) == static_cast<int>(AggKind::Count) &&
+                  static_cast<int>(AggFn::Sum) == static_cast<int>(AggKind::Sum) &&
+                  static_cast<int>(AggFn::Min) == static_cast<int>(AggKind::Min) &&
+                  static_cast<int>(AggFn::Max) == static_cast<int>(AggKind::Max) &&
+                  static_cast<int>(AggFn::Avg) == static_cast<int>(AggKind::Avg) &&
+                  static_cast<int>(AggFn::Median) == static_cast<int>(AggKind::Median),
+              "plan::AggFn and wb::AggKind must list the same functions in the same order");
 
 Predicate to_predicate(std::size_t col, const Compare& c) {
     Predicate p{col, c.op, {}};
@@ -47,58 +56,38 @@ QueryResult run_vectorized(const Node& root) {
     validate_query(root);
     const auto& agg         = std::get<Aggregate>(root.op);
     const auto  child_types = output_types(*agg.child);
+    const auto  out_types   = output_types(root);
 
-    // Until HashAggOperator is generalized: at least one Sum, all on one Float64 column, plus Counts.
-    std::optional<std::size_t> sum_col;
+    std::vector<AggSpec> specs;
     for (const AggExpr& e : agg.aggs) {
-        if (e.fn == AggFn::Count) continue;
-        if (e.fn != AggFn::Sum || child_types[*e.col] != DataType::Float64 || (sum_col && *sum_col != *e.col)) {
-            throw std::invalid_argument(std::string{"aggregate "} + agg_fn_name(e.fn) + " not supported yet");
-        }
-        sum_col = e.col;
+        const auto kind = static_cast<AggKind>(e.fn);  // AggFn and AggKind list the same functions
+        specs.push_back(e.col ? AggSpec{kind, *e.col, child_types[*e.col]} : AggSpec{kind});
     }
-    if (!sum_col) throw std::invalid_argument("aggregate count not supported yet");
-
-    auto                 input = lower(*agg.child);
-    std::vector<int64_t> keys, counts;
-    std::vector<double>  sums;
-    if (agg.group_col) {
-        HashAggOperator op{std::move(input), *agg.group_col, *sum_col};
-        while (auto batch = op.next()) {
-            const auto& k = static_cast<const Int64Vector&>(batch->column(0));
-            const auto& s = static_cast<const Float64Vector&>(batch->column(1));
-            const auto& c = static_cast<const Int64Vector&>(batch->column(2));
-            for_each_live_row(*batch, [&](std::uint32_t row) {
-                keys.push_back(k.value(row));
-                sums.push_back(s.value(row));
-                counts.push_back(c.value(row));
-            });
-        }
-    } else {
-        double  sum   = 0.0;
-        int64_t count = 0;
-        while (auto batch = input->next()) {
-            static_cast<const Float64Vector&>(batch->column(*sum_col)).visit([&](auto values) {
-                for_each_live_row(*batch, [&](std::uint32_t row) { sum += values[row]; });
-            });
-            count += batch->size();
-        }
-        sums   = {sum};
-        counts = {count};
-    }
+    HashAggOperator op{lower(*agg.child), agg.group_col, std::move(specs)};
 
     QueryResult result;
     result.grouped = agg.group_col.has_value();
-    if (result.grouped) result.columns.push_back({DataType::Int64, {}, {}, {}});
-    for (const AggExpr& e : agg.aggs)
-        result.columns.push_back({e.fn == AggFn::Count ? DataType::Int64 : DataType::Float64, {}, {}, {}});
-    for (std::size_t row = 0; row < counts.size(); ++row) {
-        std::size_t c = 0;
-        if (result.grouped) result.columns[c++].push_int(keys[row]);
-        for (const AggExpr& e : agg.aggs) {
-            auto& col = result.columns[c++];
-            if (e.fn == AggFn::Count) col.push_int(counts[row]);
-            else col.push_double(sums[row], counts[row] > 0);  // SUM over no rows is NULL
+    for (DataType t : out_types)
+        result.columns.push_back({t, {}, {}, {}});
+    while (auto batch = op.next()) {
+        for (std::size_t c = 0; c < result.columns.size(); ++c) {
+            const Vector& col = batch->column(c);
+            for_each_live_row(*batch, [&](std::uint32_t row) {
+                if (col.type() == DataType::Int64) {
+                    result.columns[c].push_int(static_cast<const Int64Vector&>(col).value(row));
+                } else {
+                    result.columns[c].push_double(static_cast<const Float64Vector&>(col).value(row));
+                }
+            });
+        }
+    }
+    // A global aggregate over no rows still answers one row: COUNT 0, everything else NULL.
+    if (!result.grouped && result.num_rows() == 0) {
+        for (std::size_t i = 0; i < agg.aggs.size(); ++i) {
+            auto& col = result.columns[i];
+            if (agg.aggs[i].fn == AggFn::Count) col.push_int(0);
+            else if (col.type == DataType::Int64) col.push_int(0, false);
+            else col.push_double(0.0, false);
         }
     }
     result.canonicalize();

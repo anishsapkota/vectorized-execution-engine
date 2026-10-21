@@ -14,8 +14,19 @@ class GroupIndex {
    public:
     explicit GroupIndex(std::size_t initial_capacity = 1024);
 
-    // The id of `key`, assigning the next id if the key is new.
-    uint32_t find_or_insert(int64_t key);
+    // The id of `key`, assigning the next id if the key is new. The lookup of an existing key is
+    // inline: it runs once per input row.
+    uint32_t find_or_insert(int64_t key) {
+        if (key != kEmptyKey && !slots_.empty()) {
+            const std::size_t mask = slots_.size() - 1;
+            for (std::size_t i = (static_cast<uint64_t>(key) * 0x9E3779B97F4A7C15ULL) & mask;; i = (i + 1) & mask) {
+                const Slot& slot = slots_[i];
+                if (slot.key == key) return slot.gid;
+                if (slot.key == kEmptyKey) break;
+            }
+        }
+        return insert_(key);
+    }
 
     uint32_t    size() const { return static_cast<uint32_t>(keys_.size()); }
     int64_t     key_of(uint32_t gid) const { return keys_[gid]; }
@@ -29,7 +40,8 @@ class GroupIndex {
         uint32_t gid = 0;
     };
 
-    void grow_();
+    uint32_t insert_(int64_t key);  // key not present: assign the next id
+    void     grow_();
 
     std::vector<Slot>    slots_;
     std::vector<int64_t> keys_;  // gid -> key

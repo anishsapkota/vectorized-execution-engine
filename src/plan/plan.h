@@ -43,6 +43,7 @@ struct HashJoin {
     std::size_t build_key;
 };  // output: probe columns, then build columns
 
+// Same order as wb::AggKind (exec/agg_spec.h); lower_vec converts by value.
 enum class AggFn : std::uint8_t { Count, Sum, Min, Max, Avg, Median };
 
 struct AggExpr {

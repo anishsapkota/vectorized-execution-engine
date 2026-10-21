@@ -28,6 +28,7 @@ using namespace wb;
 using namespace wb::codegen;
 using namespace wb::plan;
 using wbtest::make_readings;
+using wbtest::make_join_tables;
 
 namespace {
 
@@ -88,34 +89,6 @@ std::pair<int64_t, int64_t> ts_range(const Table& t) {
         hi = std::max(hi, seg->zone(1).max_i64());
     }
     return {lo, hi};
-}
-
-// probe(k int64, amount float64) and build(k int64, grp int64), several segments each.
-struct JoinTables {
-    Table probe{"probe", {{"k", DataType::Int64}, {"amount", DataType::Float64}}};
-    Table build{"build", {{"k", DataType::Int64}, {"grp", DataType::Int64}}};
-};
-
-std::unique_ptr<JoinTables> make_join_tables(int64_t probe_rows, int64_t (*probe_key)(int64_t), int64_t build_rows,
-                                             int64_t (*build_key)(int64_t)) {
-    auto t = std::make_unique<JoinTables>();
-    for (int64_t start = 0; start < probe_rows; start += 700) {
-        SegmentBuilder b{t->probe.schema()};
-        for (int64_t i = start; i < std::min(probe_rows, start + 700); ++i) {
-            b.append_int64(0, probe_key(i));
-            b.append_float64(1, 0.25 * static_cast<double>(i));
-        }
-        t->probe.add_segment(b.seal(std::nullopt, 1024));
-    }
-    for (int64_t start = 0; start < build_rows; start += 250) {
-        SegmentBuilder b{t->build.schema()};
-        for (int64_t i = start; i < std::min(build_rows, start + 250); ++i) {
-            b.append_int64(0, build_key(i));
-            b.append_int64(1, i % 7);
-        }
-        t->build.add_segment(b.seal(std::nullopt, 1024));
-    }
-    return t;
 }
 
 }  // namespace

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -85,4 +87,63 @@ inline std::unique_ptr<wb::Table> make_readings(std::size_t rows, std::size_t ro
     return t;
 }
 
+// probe(k int64, amount float64) and build(k int64, grp int64), several segments each.
+struct JoinTables {
+    wb::Table probe{"probe", {{"k", wb::DataType::Int64}, {"amount", wb::DataType::Float64}}};
+    wb::Table build{"build", {{"k", wb::DataType::Int64}, {"grp", wb::DataType::Int64}}};
+};
+
+inline std::unique_ptr<JoinTables> make_join_tables(int64_t probe_rows, int64_t (*probe_key)(int64_t), int64_t build_rows,
+                                             int64_t (*build_key)(int64_t)) {
+    auto t = std::make_unique<JoinTables>();
+    for (int64_t start = 0; start < probe_rows; start += 700) {
+        wb::SegmentBuilder b{t->probe.schema()};
+        for (int64_t i = start; i < std::min(probe_rows, start + 700); ++i) {
+            b.append_int64(0, probe_key(i));
+            b.append_float64(1, 0.25 * static_cast<double>(i));
+        }
+        t->probe.add_segment(b.seal(std::nullopt, 1024));
+    }
+    for (int64_t start = 0; start < build_rows; start += 250) {
+        wb::SegmentBuilder b{t->build.schema()};
+        for (int64_t i = start; i < std::min(build_rows, start + 250); ++i) {
+            b.append_int64(0, build_key(i));
+            b.append_int64(1, i % 7);
+        }
+        t->build.add_segment(b.seal(std::nullopt, 1024));
+    }
+    return t;
+}
+
+
+// (k int64, v float64) rows, one segment per `rows_per_segment` rows.
+inline std::unique_ptr<wb::Table> make_kv_double(const std::vector<std::pair<int64_t, double>>& rows,
+                                                 std::size_t rows_per_segment = 1000) {
+    auto t = std::make_unique<wb::Table>("kv", wb::Schema{{"k", wb::DataType::Int64}, {"v", wb::DataType::Float64}});
+    for (std::size_t start = 0; start < rows.size(); start += rows_per_segment) {
+        wb::SegmentBuilder b{t->schema()};
+        for (std::size_t i = start; i < std::min(rows.size(), start + rows_per_segment); ++i) {
+            b.append_int64(0, rows[i].first);
+            b.append_float64(1, rows[i].second);
+        }
+        t->add_segment(b.seal(std::nullopt, 1024));
+    }
+    return t;
+}
+
+inline constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+// Groups 1-3 put NaN first, in the middle, everywhere; group 4 holds only -0.0.
+inline std::unique_ptr<wb::Table> make_nan_table() {
+    return make_kv_double({{1, kNaN}, {1, 1.0}, {1, 2.0}, {2, 1.0}, {2, kNaN}, {2, 2.0},
+                           {3, kNaN}, {3, kNaN}, {4, -0.0}, {4, -0.0}});
+}
+
+// One group whose running int64 sum leaves int64 but whose final sum is 5.
+inline KeyValueRows int128_intermediate_rows() {
+    return {{1, INT64_MAX}, {1, INT64_MAX}, {1, -INT64_MAX}, {1, -INT64_MAX + 5}};
+}
+
+// Group 42 whose sum overflows int64.
+inline KeyValueRows overflow_rows() { return {{42, INT64_MAX}, {42, 1}}; }
 }  // namespace wbtest
