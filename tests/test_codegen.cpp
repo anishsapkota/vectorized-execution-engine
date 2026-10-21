@@ -127,7 +127,11 @@ TEST(runtime_group_table_matches_group_index) {
 TEST(runtime_median_buffer_matches_sort) {
     // Reference: sort each group's values (NaN last) and apply the spec formula.
     auto reference = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end(), [](double a, double b) { return !std::isnan(a) && (std::isnan(b) || a < b); });
+        std::sort(v.begin(), v.end(), [](double a, double b) {
+            const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
+            if (a_nan || b_nan) return !a_nan || (b_nan && std::bit_cast<uint64_t>(a) < std::bit_cast<uint64_t>(b));
+            return a < b || (a == b && std::signbit(a) && !std::signbit(b));
+        });
         const std::size_t n = v.size();
         return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
     };
@@ -555,4 +559,11 @@ TEST(cg_median_above_join) {
     auto customers = make_customers(10'000);
     check_engines_agree(*aggregate(join(filter(scan(*orders, {0, 1}), {{1, CompareOp::Gt, 50.0}}), scan(*customers, {0, 1}), 0, 0),
                                    3, {{AggFn::Avg, 1}, {AggFn::Median, 1}}));
+}
+
+TEST(cg_median_signed_zeros_and_nan_payloads) {
+    fresh_cache_dir();
+    auto t = make_kv_double(signed_zero_median_rows(), 3);
+    check_engines_agree(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}}));
+    check_engines_agree(*aggregate(scan(*t, {0, 1}), std::nullopt, {{AggFn::Median, 1}}));
 }

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -171,6 +172,17 @@ inline KeyValueRows median_int_rows() {
 // Group 1: even count with NaN in the middle pair -> NaN. Group 2: odd count, NaN sorts last -> 2.0.
 inline std::vector<std::pair<int64_t, double>> nan_median_rows() {
     return {{1, 1.0}, {1, kNaN}, {1, 3.0}, {1, kNaN}, {2, 1.0}, {2, 2.0}, {2, kNaN}};
+}
+
+// Signed zeros (and NaNs with two payloads) are equal under `<`, so a median whose middle values
+// include them is only deterministic under a total order: -0.0 before +0.0, NaNs last by bits.
+inline std::vector<std::pair<int64_t, double>> signed_zero_median_rows() {
+    const double nan_a = std::bit_cast<double>(uint64_t{0x7FF8000000000001ULL});
+    const double nan_b = std::bit_cast<double>(uint64_t{0x7FF8000000000002ULL});
+    return {{1, +0.0}, {1, 1.0}, {1, -0.0}, {1, +0.0}, {1, 1.0},                 // odd: middle is +0.0
+            {2, -0.0}, {2, +0.0}, {2, -0.0}, {2, +0.0},                          // even: (-0 + +0) / 2
+            {3, -0.0}, {3, -0.0}, {3, +0.0}, {3, 5.0},                           // even: (-0 + +0) / 2
+            {4, nan_b}, {4, 1.0}, {4, nan_a}, {4, nan_b}, {4, nan_a}, {4, 2.0}};  // even: (nan_a + nan_a) / 2
 }
 
 inline KeyValueRows int64_extreme_rows() { return {{1, INT64_MIN}, {1, INT64_MAX}}; }

@@ -190,7 +190,15 @@ struct StateRows {
 // ---------------------------------------------------------------------------------------------
 
 inline bool median_less(int64_t a, int64_t b) { return a < b; }
-inline bool median_less(double a, double b) { return a == a && (b != b || a < b); }
+// Total order: numbers ascending with -0.0 before +0.0, then NaNs ordered by bit pattern, so
+// values `<` cannot tell apart still get a fixed position (same order as HashAggOperator).
+inline bool median_less(double a, double b) {
+    const bool a_nan = a != a, b_nan = b != b;
+    if (a_nan || b_nan) {
+        return !a_nan || (b_nan && __builtin_bit_cast(uint64_t, a) < __builtin_bit_cast(uint64_t, b));
+    }
+    return a < b || (a == b && __builtin_signbit(a) && !__builtin_signbit(b));
+}
 
 template <class T>
 struct MedianBuffer {

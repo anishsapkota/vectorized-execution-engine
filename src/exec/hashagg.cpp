@@ -1,6 +1,7 @@
 #include "exec/hashagg.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <functional>
 #include <stdexcept>
@@ -193,7 +194,14 @@ void HashAggOperator::consume_global_(const Batch& batch, const Rows& rows) {
 
 namespace {
 
-bool less_nan_last(double a, double b) { return !std::isnan(a) && (std::isnan(b) || a < b); }
+// MEDIAN's total order (shared with the codegen runtime): numbers ascending with -0.0 before
+// +0.0, then NaNs ordered by bit pattern. Values `<` cannot tell apart (signed zeros, NaN
+// payloads) get a fixed position, so the median does not depend on the selection algorithm.
+bool less_nan_last(double a, double b) {
+    const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
+    if (a_nan || b_nan) return !a_nan || (b_nan && std::bit_cast<uint64_t>(a) < std::bit_cast<uint64_t>(b));
+    return a < b || (a == b && std::signbit(a) && !std::signbit(b));
+}
 
 // Median of values[begin, end) (non-empty); reorders the range.
 template <typename T, typename Less>

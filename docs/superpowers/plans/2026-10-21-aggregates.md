@@ -26,7 +26,7 @@
 - MEDIAN:
   - odd n → `static_cast<double>(x[n/2])`;
   - even n → `(static_cast<double>(x[n/2-1]) + static_cast<double>(x[n/2])) / 2.0`;
-  - values are ordered with NaN greater than every number.
+  - values are ordered by a total order: numbers ascending with `-0.0` before `+0.0`, then NaNs ordered by bit pattern.
 - Result types:
   - Count → Int64;
   - Sum, Min, Max → same as the input column;
@@ -36,7 +36,7 @@
 - `runtime.h`: `kAbiVersion = 3`; still only `<cstdint>`/`<cstddef>`, no STL.
 - `exec/` must not include `plan/`.
 - `AggHashTable` and `parallel_agg` are unchanged.
-- `wb_bench` checksums stay equal to `bench/results/after-f64.txt`.
+- `wb_bench` checksums stay equal to `bench/results/after-f64.txt`, except the group-by total, which changes with group emission order (ruled in Task 4; see spec §10).
 - Commit each task on branch `codegen`, ending the message with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus

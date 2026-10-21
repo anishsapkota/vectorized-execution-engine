@@ -132,7 +132,12 @@ std::vector<Row> reference_rows(const Node& node) {
 
 // Every aggregate computed the obvious way over each group's rows, in scan order. Must agree
 // exactly with spec section 3; both engines are checked against this.
-bool less_nan_last(double a, double b) { return !std::isnan(a) && (std::isnan(b) || a < b); }
+// MEDIAN's total order (spec section 3): -0.0 before +0.0, NaNs last ordered by bit pattern.
+bool less_nan_last(double a, double b) {
+    const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
+    if (a_nan || b_nan) return !a_nan || (b_nan && std::bit_cast<uint64_t>(a) < std::bit_cast<uint64_t>(b));
+    return a < b || (a == b && std::signbit(a) && !std::signbit(b));
+}
 
 void reference_aggregate(const AggExpr& e, DataType in, const std::vector<const Row*>& rows, bool grouped,
                          int64_t key, ResultColumn& out) {
@@ -596,4 +601,13 @@ TEST(vec_group_column_aggregated) {
     auto t = make_readings(20'000);
     check_matches_reference(*aggregate(scan(*t, {0, 2}), 0,
                                        {{AggFn::Min, 0}, {AggFn::Max, 0}, {AggFn::Median, 0}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(vec_median_signed_zeros_and_nan_payloads) {
+    auto t = make_kv_double(signed_zero_median_rows(), 3);
+    check_matches_reference(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}}));
+    check_matches_reference(*aggregate(scan(*t, {0, 1}), std::nullopt, {{AggFn::Median, 1}}));
+    const auto r = run_vectorized(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}}));
+    CHECK_EQ(std::bit_cast<uint64_t>(r.double_at(1, 0)), std::bit_cast<uint64_t>(+0.0));
+    CHECK_EQ(std::bit_cast<uint64_t>(r.double_at(1, 1)), std::bit_cast<uint64_t>(-0.0 + +0.0));
 }

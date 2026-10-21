@@ -15,7 +15,8 @@ Success criteria:
 
 - Every aggregate, on both input types, grouped and global, matches the reference interpreter
   (vectorized engine) and the vectorized engine (generated code) exactly.
-- Q1–Q5 results and `wb_bench` checksums are unchanged.
+- Q1–Q5 results are unchanged. `wb_bench` checksums are unchanged except the group-by total,
+  whose last digits change with group emission order (per-group values are unchanged; see §10).
 - `wb_codegen` reports Q6–Q9 with `match = yes`; the spec gains a results section covering the
   predictions in section 7.
 
@@ -73,9 +74,12 @@ Result types:
   - `n` odd: `static_cast<double>(x[n/2])`;
   - `n` even: `(static_cast<double>(x[n/2 - 1]) + static_cast<double>(x[n/2])) / 2.0`.
 
-  The result does not depend on the selection algorithm, so the engines may use different ones.
-  NaN in a Float64 median input: values are ordered with NaN greater than every number (total
-  order used by both engines' selection and by the reference sort).
+  Float64 values are ordered by one **total** order, used by both engines' selection and by the
+  reference sort: numbers ascending with `-0.0` before `+0.0`, then every NaN, NaNs ordered by
+  bit pattern. Under `<` alone signed zeros and NaN payloads compare equal, so which of them
+  lands in the middle would depend on the selection algorithm (an even-count median of
+  `{-0, -0, +0, +0}` could be `-0` or `+0`). With the total order the result is the same for any
+  correct selection algorithm, so the engines may use different ones.
 - **SUM(Int64) overflow.** If a group's final `__int128` sum is outside
   `[INT64_MIN, INT64_MAX]`, the query throws `std::overflow_error` whose message contains the
   group key (or `global`). Intermediate values may exceed int64. AVG(Int64) never overflows.
@@ -201,7 +205,9 @@ Same columns and rules as the codegen spec section 8. Results are appended to th
   column, empty `aggs`, a Float64 group key, an aggregate below the root.
 - **Runtime:** `GroupTable` assigns the same gids in the same order as `GroupIndex` over a random
   key stream; `MedianBuffer::finalize` equals a sorted reference over random groups (with NaN).
-- **Regression:** Q1–Q5 match; `wb_bench` checksums equal `bench/results/after-f64.txt`.
+- **Regression:** Q1–Q5 match; `wb_bench` checksums equal `bench/results/after-f64.txt` except
+  the group-by total (emission order, §10); per-group sums are pinned by
+  `vec_group_sums_match_agg_hash_table`.
 - **Sanitizers:** the ASan+UBSan run including generated libraries.
 
 ## 9. Risks
@@ -219,7 +225,7 @@ Setup:
 - Apple M3 Pro, single-threaded, best of 7 runs.
 - Data: readings 10M rows; orders 2M rows; customers 100k rows.
 - Raw output: `bench/results/codegen.txt`.
-- All 27 rows (9 queries × 3 engines) matched bit for bit.
+- All 18 compiled rows (9 queries × `-O1`/`-O3`) matched the vectorized result bit for bit.
 
 | Query | vec ms | cg-O3 ms | speedup | Prediction | Verdict |
 |---|---|---|---|---|---|
@@ -230,8 +236,8 @@ Setup:
 
 **Q6.** The vectorized engine makes four passes per batch over (gid, value): one per
 aggregate after the gid pass. The generated loop updates one `Row` per tuple. The gain is
-smaller than the join's (Q5/Q9) because both engines pay the same group-table probe per row,
-which dominates.
+smaller than the join's (Q5/Q9), most likely because both engines pay the same group-table probe
+per row (inferred, not profiled).
 
 **Q7 and Q8.** Most of the time is MEDIAN-specific. Q7 takes about 136–149 ms against about
 26 ms for a grouped SUM/COUNT over the same rows (Q4), so roughly 80% goes to collecting values
@@ -240,11 +246,13 @@ step is a counting sort plus a per-group selection, with the same complexity in 
 (`std::nth_element` in one, the runtime's three-way quickselect in the other), so the execution
 model barely matters.
 
-MEDIAN memory, computed for 10M rows:
+MEDIAN memory for 10M rows (computed, not measured):
 
-- 4 B gid plus 8 B value collected per input row;
-- plus 8 B per row for the bucketed copy at finalize;
-- about 20 B per row at peak, roughly 200 MB transient for Q7.
+- payload: 4 B gid plus 8 B value collected per input row, plus 8 B per row for the bucketed
+  copy at finalize, so 20 B per row;
+- buffers grow by doubling, so capacity rounds 10M up to about 16.8M, and old and new buffers
+  coexist during the last grow. The realistic peak is about 28–30 B per row, roughly
+  280–300 MB transient for Q7.
 
 **Q9.** The same cause as Q5: the vectorized join materializes every output row into chunks
 (31k allocations per run, against 72) before the aggregate sees it.
@@ -254,10 +262,13 @@ MEDIAN memory, computed for 10M rows:
 - **Q1–Q3:** unchanged. The first cut of the generalized operator ran global aggregates through
   per-row group-id arrays and was 2× slower (Q1 vec 12.7 ms). Global aggregates now accumulate
   in a local per batch, as the old drain loop did.
-- **Q4:** now about 25–27 ms in **both** engines, against about 17.7 ms before. Both replaced a
+- **Q4:** now about 25–28 ms in **both** engines (across `-O1`/`-O3`), against about 17.7 ms
+  before. Both replaced a
   key → {sum, count} table with dense group ids plus separate per-group state: one more
   dependent memory access per row. Q4 is still a tie (cg-O3 1.05×).
-- **`wb_bench` "groupby device 1T":** 16.9 → about 25.7 ms, for the same reason. Per-group
+- **`wb_bench` "groupby device 1T":** 16.9 → 25.7–26.6 ms (two runs), for the same reason. A
+  fused fast path for SUM/COUNT-only lists, or state stored inline in the group slot, would
+  likely recover it; that is a follow-up, not part of this change. Per-group
   sums are bit-identical to the old path (test `vec_group_sums_match_agg_hash_table`). The
   printed total over all groups changed in the last digits because groups are now emitted in
   first-seen order.
