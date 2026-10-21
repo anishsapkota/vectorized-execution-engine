@@ -457,3 +457,34 @@ TEST(every_valid_strategy_computes_the_same_join) {
     }
     CHECK(runs >= 10);
 }
+
+TEST(hash_join_output_columns_are_reused) {
+    // 20,000 output rows (one match per probe row) span several output batches; every batch must
+    // be served from the same operator-owned columns.
+    KeyValueRows probe_rows, build_rows;
+    for (int64_t i = 0; i < 20'000; ++i)
+        probe_rows.emplace_back(i % 100, i);
+    for (int64_t key = 0; key < 100; ++key)
+        build_rows.emplace_back(key, -key);
+    auto probe_table = make_table("probe", probe_rows, 3'000);
+    auto build_table = make_table("build", build_rows);
+
+    {
+        HashJoinOperator join{std::make_unique<ScanOperator>(*probe_table, std::nullopt),
+                              std::make_unique<ScanOperator>(*build_table, std::nullopt), 0, 0};
+        std::vector<std::vector<const Vector*>> batches;
+        while (auto batch = join.next()) {
+            std::vector<const Vector*> cols;
+            for (std::size_t c = 0; c < batch->num_columns(); ++c)
+                cols.push_back(&batch->column(c));
+            batches.push_back(cols);
+        }
+        CHECK(batches.size() >= 2);
+        for (const auto& cols : batches)
+            CHECK(cols == batches.front());
+    }
+
+    HashJoinOperator join{std::make_unique<ScanOperator>(*probe_table, std::nullopt),
+                          std::make_unique<ScanOperator>(*build_table, std::nullopt), 0, 0};
+    CHECK(collect_join(join) == nested_loop_join(probe_rows, build_rows));
+}
