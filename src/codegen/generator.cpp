@@ -113,6 +113,7 @@ class CodeWriter {
 struct Column {
     bool                         is_int;
     std::function<std::string()> get;
+    std::string                  raw_f32;  // float-typed expression for a narrow scan column, else ""
 };
 using Ctx      = std::vector<Column>;
 using Consumer = std::function<void(Ctx&)>;
@@ -183,7 +184,8 @@ class Generator {
                 cur().prologue.push_back(std::string{"const "} + elem + "* f" + std::to_string(p) +
                                          " = static_cast<const " + elem + "*>(seg.cols[" + std::to_string(p) +
                                          "].data);");
-                ctx.push_back(lazy(false, "static_cast<double>(f" + std::to_string(p) + "[i])"));
+                ctx.push_back(lazy(false, "static_cast<double>(f" + std::to_string(p) + "[i])",
+                                   def.narrow_float ? "f" + std::to_string(p) + "[i]" : ""));
             }
         }
         consume(ctx);
@@ -241,7 +243,7 @@ class Generator {
     }
 
     // A column whose load is emitted at first use, into whatever scope is current then.
-    Column lazy(bool is_int, std::string expr) {
+    Column lazy(bool is_int, std::string expr, std::string raw_f32 = "") {
         auto name = std::make_shared<std::string>();
         return Column{is_int, [this, is_int, expr, name] {
                           if (name->empty()) {
@@ -250,7 +252,8 @@ class Generator {
                                               " = " + expr + ";");
                           }
                           return *name;
-                      }};
+                      },
+                      std::move(raw_f32)};
     }
 
     void consume_filter(const plan::Filter& f, Ctx& ctx, const Consumer& consume) {
@@ -269,6 +272,7 @@ class Generator {
         bool        is_int;  // input column is Int64
         std::size_t col;
         std::string name;
+        bool        f32 = false;  // MEDIAN over a narrow scan column: store floats
     };
 
     void plan_fields(const plan::Aggregate& agg) {
@@ -286,6 +290,8 @@ class Generator {
         }
     }
 
+    static std::string median_type(const Field& f) { return f.is_int ? "int64_t" : f.f32 ? "float" : "double"; }
+
     static std::string field_type(const Field& f) {
         const bool sum_like = f.fn == plan::AggFn::Sum || f.fn == plan::AggFn::Avg;
         if (f.is_int) return sum_like ? "__int128" : "int64_t";
@@ -295,7 +301,7 @@ class Generator {
     static bool in_row(const Field& f) { return f.fn != plan::AggFn::Count && f.fn != plan::AggFn::Median; }
 
     // Per-tuple update of Row `r` (a group's record, or the global accumulator) for group `gid`.
-    void emit_updates(const std::string& r, const std::string& gid, const std::vector<std::string>& vals) {
+    void emit_updates(const std::string& r, const std::vector<std::string>& vals) {
         cur().body.line("++" + r + ".count;");
         for (std::size_t i = 0; i < fields_.size(); ++i) {
             const Field& f = fields_[i];
@@ -313,7 +319,7 @@ class Generator {
                     cur().body.line("if (" + v + " > " + m + " || " + v + " != " + v + ") " + m + " = " + v + ";");
                     break;
                 case plan::AggFn::Median:
-                    cur().body.line("st." + f.name + ".append(" + gid + ", " + v + ");");
+                    cur().body.line("st." + f.name + ".append(" + r + "." + f.name + ", " + v + ");");
                     break;
                 default:
                     break;
@@ -324,8 +330,16 @@ class Generator {
     void consume_aggregate(const plan::Aggregate& agg, Ctx& ctx) {
         // Load every needed value before opening a scope (lazy loads must stay in row scope).
         std::vector<std::string> vals(fields_.size());
-        for (std::size_t i = 0; i < fields_.size(); ++i)
-            if (fields_[i].fn != plan::AggFn::Count) vals[i] = ctx[fields_[i].col].get();
+        for (std::size_t i = 0; i < fields_.size(); ++i) {
+            Field& f = fields_[i];
+            if (f.fn == plan::AggFn::Count) continue;
+            if (f.fn == plan::AggFn::Median && !ctx[f.col].raw_f32.empty()) {
+                f.f32   = true;  // keep the float: MEDIAN stores the column's storage type
+                vals[i] = ctx[f.col].raw_f32;
+            } else {
+                vals[i] = ctx[f.col].get();
+            }
+        }
 
         if (agg.group_col) {
             const std::string key = ctx[*agg.group_col].get();
@@ -337,10 +351,10 @@ class Generator {
             }
             init += "}";
             cur().body.open("{");
-            cur().body.line("const uint32_t g = st.groups.find_or_insert(" + key + ");");
-            cur().body.line("if (g == st.rows.size) st.rows.push(" + init + ");");
-            cur().body.line("Row& e = st.rows.data[g];");
-            emit_updates("e", "g", vals);
+            cur().body.line("bool fresh = false;");
+            cur().body.line("Row& e = *st.groups.find_or_insert(" + key + ", fresh);");
+            cur().body.line("if (fresh) e = " + init + ";");
+            emit_updates("e", vals);
             cur().body.close();
             return;
         }
@@ -357,7 +371,7 @@ class Generator {
             if (f.fn == plan::AggFn::Min || f.fn == plan::AggFn::Max) first += " acc." + f.name + " = " + vals[i] + ";";
         }
         if (!first.empty()) cur().body.line("if (acc.count == 0) {" + first + " }");
-        emit_updates("acc", "0u", vals);
+        emit_updates("acc", vals);
     }
 
     // Serializes one group's Row into an output row; returns 3 on SUM(INT64) overflow.
@@ -419,17 +433,18 @@ class Generator {
         w.line("int64_t count;");
         for (const Field& f : fields_)
             if (in_row(f)) w.line(field_type(f) + " " + f.name + ";");
+        for (const Field& f : fields_)
+            if (f.fn == plan::AggFn::Median) w.line("wb_rt::MedianHandle " + f.name + ";");
         w.close("};");
         w.line("");
         w.open("struct State {");
         w.line("Row acc{};  // global aggregate");
         for (const Field& f : fields_) {
             if (f.fn != plan::AggFn::Median) continue;
-            w.line(std::string{"wb_rt::MedianBuffer<"} + (f.is_int ? "int64_t" : "double") + "> " + f.name + ";");
+            w.line(std::string{"wb_rt::MedianStore<"} + median_type(f) + "> " + f.name + ";");
             w.line("double* medv" + f.name.substr(3) + " = nullptr;  // per-group medians after finalize");
         }
-        w.line("wb_rt::GroupTable groups;");
-        w.line("wb_rt::StateRows<Row> rows;");
+        w.line("wb_rt::GroupRows<Row> groups;");
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
             w.line("wb_rt::JoinTable jt" + std::to_string(id) + ";");
         w.close("};");
@@ -455,24 +470,31 @@ class Generator {
             for (const auto& stmt : pipeline->after_run)
                 w.line(stmt);
         }
-        const std::string ngroups = grouped_ ? "st.rows.size" : "(st.acc.count > 0 ? 1u : 0u)";
+        const std::string ngroups = grouped_ ? "st.groups.size()" : "(st.acc.count > 0 ? 1u : 0u)";
         if (has_median_) {
             w.open("if (rc == 0) {");
             w.line("const uint32_t ngroups = " + ngroups + ";");
-            w.line("int64_t* counts = static_cast<int64_t*>(__builtin_malloc((ngroups ? ngroups : 1) * sizeof(int64_t)));");
-            w.line(std::string{"for (uint32_t g = 0; g < ngroups; ++g) counts[g] = "} +
-                   (grouped_ ? "st.rows.data[g].count;" : "st.acc.count;"));
             for (const Field& f : fields_) {
                 if (f.fn != plan::AggFn::Median) continue;
                 const std::string v = "st.medv" + f.name.substr(3);
+                const std::string t = median_type(f);
                 w.line(v + " = static_cast<double*>(__builtin_malloc((ngroups ? ngroups : 1) * sizeof(double)));");
-                w.line("st." + f.name + ".finalize(counts, ngroups, " + v + ");");
+                if (grouped_) {
+                    w.open("{");
+                    w.line(t + "* scratch = static_cast<" + t + "*>(__builtin_malloc((st." + f.name +
+                           ".max_group ? st." + f.name + ".max_group : 1) * sizeof(" + t + ")));");
+                    w.line("for (uint32_t g = 0; g < ngroups; ++g) " + v + "[g] = st." + f.name +
+                           ".finalize_group(st.groups.row_of(g)." + f.name + ", scratch);");
+                    w.line("__builtin_free(scratch);");
+                    w.close();
+                } else {
+                    w.line("if (ngroups) " + v + "[0] = st." + f.name + ".finalize_single(st.acc." + f.name + ");");
+                }
             }
-            w.line("__builtin_free(counts);");
             w.close();
         }
         if (grouped_) {
-            w.line("for (uint32_t g = 0; rc == 0 && g < st.rows.size; ++g) rc = emit_group(st, g, st.rows.data[g], st.groups.key_of(g), 0, out);");
+            w.line("for (uint32_t g = 0; rc == 0 && g < st.groups.size(); ++g) rc = emit_group(st, g, st.groups.row_of(g), st.groups.key_of(g), 0, out);");
         } else {
             w.line("if (rc == 0 && st.acc.count > 0) rc = emit_group(st, 0, st.acc, 0, 1, out);  // empty: host adds the NULL row");
         }
@@ -481,10 +503,7 @@ class Generator {
             w.line("st." + f.name + ".release();");
             w.line("__builtin_free(st.medv" + f.name.substr(3) + ");");
         }
-        if (grouped_) {
-            w.line("st.groups.release();");
-            w.line("st.rows.release();");
-        }
+        if (grouped_) w.line("st.groups.release();");
         for (std::size_t id = 0; id < join_cols_.size(); ++id)
             w.line("st.jt" + std::to_string(id) + ".release();");
         w.line("return rc;");

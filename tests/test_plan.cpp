@@ -11,7 +11,6 @@
 #include <string>
 #include <vector>
 
-#include "exec/group_index.h"
 #include "exec/group_slots.h"
 #include "exec/median_store.h"
 #include "exec/parallel_agg.h"
@@ -464,27 +463,6 @@ TEST(reference_median_and_nulls) {
     CHECK_EQ(g.num_rows(), std::size_t{1});
     CHECK(g.is_null(0, 0));
     CHECK_EQ(g.int_at(1, 0), int64_t{0});
-}
-
-TEST(group_index_dense_first_seen) {
-    GroupIndex                  index;
-    std::vector<uint32_t>       gids;
-    for (int64_t k : {int64_t{7}, int64_t{-3}, int64_t{7}, INT64_MIN, int64_t{-3}, int64_t{0}})
-        gids.push_back(index.find_or_insert(k));
-    CHECK(gids == (std::vector<uint32_t>{0, 1, 0, 2, 1, 3}));
-    CHECK_EQ(index.size(), uint32_t{4});
-    CHECK_EQ(index.key_of(2), INT64_MIN);
-    CHECK_EQ(index.key_of(3), int64_t{0});
-}
-
-TEST(group_index_growth_keeps_ids) {
-    GroupIndex index;
-    for (int64_t i = 0; i < 5'000; ++i)
-        CHECK_EQ(index.find_or_insert(i * 7'919), static_cast<uint32_t>(i));
-    for (int64_t i = 0; i < 5'000; ++i)
-        CHECK_EQ(index.find_or_insert(i * 7'919), static_cast<uint32_t>(i));
-    CHECK_EQ(index.size(), uint32_t{5'000});
-    CHECK(index.capacity() >= 2 * static_cast<std::size_t>(index.size()));
 }
 
 namespace {

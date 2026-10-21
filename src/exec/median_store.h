@@ -42,20 +42,20 @@ template <typename T>
 class MedianStore {
    public:
     using value_type = T;
-    // Blocks are exactly 2 KiB and chunks exactly 128 KiB (whole pages): 255 int64/double values or
-    // 510 floats per block.
-    static constexpr uint32_t kBlockValues = static_cast<uint32_t>((2048 - 2 * sizeof(uint32_t)) / sizeof(T));
+    // Blocks hold exactly 2 KiB of values (256 int64/double or 512 float, a power of two) with
+    // their next/size headers kept out of band, so chunks are exactly 128 KiB (whole pages) and
+    // value i of a chain is found with a shift and a mask.
+    static constexpr uint32_t kBlockValues = static_cast<uint32_t>(2048 / sizeof(T));
     static constexpr uint32_t kChunkBlocks = 64;
 
     void append(MedianHandle& h, T v) {
-        if (h.tail == UINT32_MAX || block_(h.tail).n == kBlockValues) {
+        if (h.tail == UINT32_MAX || size_[h.tail] == kBlockValues) {
             const uint32_t b = new_block_();
             if (h.tail == UINT32_MAX) h.head = b;
-            else block_(h.tail).next = b;
+            else next_[h.tail] = b;
             h.tail = b;
         }
-        Block& block = block_(h.tail);
-        block.v[block.n++] = v;
+        block_(h.tail).v[size_[h.tail]++] = v;
         ++h.count;
     }
 
@@ -63,10 +63,10 @@ class MedianStore {
     double finalize_group(const MedianHandle& h, std::vector<T>& scratch) {
         scratch.resize(h.count);
         std::size_t k = 0;
-        for (uint32_t b = h.head; b != UINT32_MAX; b = block_(b).next) {
+        for (uint32_t b = h.head; b != UINT32_MAX; b = next_[b]) {
             const Block& block = block_(b);
-            std::copy(block.v, block.v + block.n, scratch.data() + k);
-            k += block.n;
+            std::copy(block.v, block.v + size_[b], scratch.data() + k);
+            k += size_[b];
         }
         return select_(scratch.data(), scratch.size());
     }
@@ -81,6 +81,8 @@ class MedianStore {
         };
         const double median = select_in_place_(h.count, get);
         chunks_.clear();
+        next_.clear();
+        size_.clear();
         next_block_ = 0;
         return median;
     }
@@ -94,19 +96,20 @@ class MedianStore {
 
    private:
     struct Block {
-        uint32_t next = UINT32_MAX;
-        uint32_t n    = 0;
-        T        v[kBlockValues];
+        T v[kBlockValues];
     };
     struct Chunk {
         Block blocks[kChunkBlocks];
     };
     static_assert(sizeof(Block) == 2048, "MEDIAN blocks must be exactly 2 KiB");
+    static_assert((kBlockValues & (kBlockValues - 1)) == 0, "values per block must be a power of two");
 
     Block& block_(uint32_t id) { return chunks_[id / kChunkBlocks]->blocks[id % kChunkBlocks]; }
 
     uint32_t new_block_() {
         if (next_block_ % kChunkBlocks == 0) chunks_.push_back(std::unique_ptr<Chunk>(new Chunk));
+        next_.push_back(UINT32_MAX);
+        size_.push_back(0);
         return next_block_++;
     }
 
@@ -144,6 +147,8 @@ class MedianStore {
     }
 
     std::vector<std::unique_ptr<Chunk>> chunks_;
+    std::vector<uint32_t>               next_;  // per block: next block of the chain
+    std::vector<uint32_t>               size_;  // per block: values stored
     uint32_t                            next_block_ = 0;
 };
 

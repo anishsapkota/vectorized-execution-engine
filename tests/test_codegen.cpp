@@ -14,12 +14,14 @@
 #include <cstdint>
 #include <map>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "codegen/compiler.h"
 #include "codegen/host.h"
 #include "codegen/runtime.h"
-#include "exec/group_index.h"
+#include "exec/group_slots.h"
+#include "exec/median_store.h"
 #include "exec/hash_table.h"
 #include "plan/lower_vec.h"
 #include "plan/plan.h"
@@ -108,90 +110,93 @@ TEST(runtime_hash_matches_engine) {
         CHECK_EQ(wb_rt::hash64(k), static_cast<uint64_t>(k) * 0x9E3779B97F4A7C15ULL);
 }
 
-TEST(runtime_group_table_matches_group_index) {
-    GroupIndex        engine;
-    wb_rt::GroupTable rt;
+TEST(runtime_group_rows_match_group_slots) {
+    struct Row {
+        int64_t count;
+    };
+    GroupSlots              engine{8, 8};
+    wb_rt::GroupRows<Row>   rt;
     rt.init();
     uint64_t state = 1;
     for (int i = 0; i < 50'000; ++i) {
         state             = state * 6364136223846793005ULL + 1442695040888963407ULL;
         const int64_t key = i % 997 == 0 ? INT64_MIN : static_cast<int64_t>(state >> 33) % 3'000 - 1'500;
-        CHECK_EQ(rt.find_or_insert(key), engine.find_or_insert(key));
+        bool          f1 = false, f2 = false;
+        std::byte*    es = engine.find_or_insert(key, f1);
+        Row*          rr = rt.find_or_insert(key, f2);
+        CHECK_EQ(f1, f2);
+        if (f1) *reinterpret_cast<int64_t*>(es) = 0;
+        if (f2) *rr = Row{0};
+        ++*reinterpret_cast<int64_t*>(es);
+        ++rr->count;
     }
     CHECK_EQ(rt.size(), engine.size());
-    for (uint32_t g = 0; g < engine.size(); ++g)
+    for (uint32_t g = 0; g < engine.size(); ++g) {
         CHECK_EQ(rt.key_of(g), engine.key_of(g));
+        CHECK_EQ(rt.row_of(g).count, *reinterpret_cast<const int64_t*>(engine.state_of(g)));
+    }
     rt.release();
 }
 
-TEST(runtime_median_buffer_matches_sort) {
-    // Reference: sort each group's values (NaN last) and apply the spec formula.
-    auto reference = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end(), [](double a, double b) {
-            const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
-            if (a_nan || b_nan) return !a_nan || (b_nan && std::bit_cast<uint64_t>(a) < std::bit_cast<uint64_t>(b));
-            return a < b || (a == b && std::signbit(a) && !std::signbit(b));
-        });
-        const std::size_t n = v.size();
-        return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
-    };
-    uint64_t state = 5;
-    auto     next  = [&] { return state = state * 6364136223846793005ULL + 1442695040888963407ULL; };
-
-    const uint32_t                   groups = 300;
-    std::vector<std::vector<double>> by_group(groups);
-    std::vector<std::vector<int64_t>> ints(groups);
-    wb_rt::MedianBuffer<double>      f;
-    wb_rt::MedianBuffer<int64_t>     i;
-    std::vector<int64_t>             counts(groups, 0);
-    for (uint32_t g = 0; g < groups; ++g) {
-        const int n = 1 + static_cast<int>(next() % 60);
-        for (int k = 0; k < n; ++k) {
-            const double  d = next() % 50 == 0 ? kNaN : static_cast<double>(next() >> 40) / 7.0;
-            const int64_t x = static_cast<int64_t>(next() >> 20) - (int64_t{1} << 43);
-            by_group[g].push_back(d);
-            ints[g].push_back(x);
-            ++counts[g];
-        }
+namespace {
+template <typename T>
+T rt_random_value(uint64_t& state) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    if constexpr (std::is_floating_point_v<T>) {
+        const uint64_t pick = state >> 58;
+        if (pick == 0) return std::numeric_limits<T>::quiet_NaN();
+        if (pick == 1) return -T{0};
+        if (pick == 2) return T{0};
+        return static_cast<T>(static_cast<double>(state >> 40) / 64.0 - 100.0);
+    } else {
+        return static_cast<int64_t>(state >> 20) - (int64_t{1} << 43);
     }
-    // Append interleaved across groups, as rows arrive.
-    for (std::size_t k = 0; k < 60; ++k) {
-        for (uint32_t g = 0; g < groups; ++g) {
-            if (k >= by_group[g].size()) continue;
-            f.append(g, by_group[g][k]);
-            i.append(g, ints[g][k]);
-        }
-    }
-    std::vector<double> got_f(groups), got_i(groups);
-    f.finalize(counts.data(), groups, got_f.data());
-    i.finalize(counts.data(), groups, got_i.data());
-    for (uint32_t g = 0; g < groups; ++g) {
-        CHECK_EQ(std::bit_cast<uint64_t>(got_f[g]), std::bit_cast<uint64_t>(reference(by_group[g])));
-        std::vector<int64_t> v = ints[g];
-        std::sort(v.begin(), v.end());
-        const std::size_t n = v.size();
-        const double want = n % 2 ? static_cast<double>(v[n / 2])
-                                  : (static_cast<double>(v[n / 2 - 1]) + static_cast<double>(v[n / 2])) / 2.0;
-        CHECK_EQ(std::bit_cast<uint64_t>(got_i[g]), std::bit_cast<uint64_t>(want));
-    }
-    f.release();
-    i.release();
 }
 
-TEST(runtime_state_rows_grow) {
-    struct R {
-        int64_t a;
-        double  b;
-    };
-    wb_rt::StateRows<R> rows;
-    for (int64_t k = 0; k < 10'000; ++k)
-        rows.push(R{k, 0.5 * static_cast<double>(k)});
-    CHECK_EQ(rows.size, uint32_t{10'000});
-    for (uint32_t k = 0; k < rows.size; ++k) {
-        CHECK_EQ(rows.data[k].a, static_cast<int64_t>(k));
-        CHECK_EQ(rows.data[k].b, 0.5 * static_cast<double>(k));
+template <typename T>
+void check_runtime_median_store() {
+    std::vector<std::size_t> sizes{254, 255, 256, 509, 510, 511, 513};
+    uint64_t                 state = 23;
+    for (int g = 0; g < 200; ++g)
+        sizes.push_back(1 + static_cast<std::size_t>((state = state * 6364136223846793005ULL + 1) >> 54) % 700);
+    MedianStore<T>                 engine;
+    wb_rt::MedianStore<T>          rt;
+    std::vector<MedianHandle>      eh(sizes.size());
+    std::vector<wb_rt::MedianHandle> rh(sizes.size());
+    for (std::size_t k = 0; k < 700; ++k) {
+        for (std::size_t g = 0; g < sizes.size(); ++g) {
+            if (k >= sizes[g]) continue;
+            const T v = rt_random_value<T>(state);
+            engine.append(eh[g], v);
+            rt.append(rh[g], v);
+        }
     }
-    rows.release();
+    std::vector<T> scratch_e;
+    std::vector<T> scratch_r(rt.max_group);
+    for (std::size_t g = 0; g < sizes.size(); ++g) {
+        CHECK_EQ(std::bit_cast<uint64_t>(rt.finalize_group(rh[g], scratch_r.data())),
+                 std::bit_cast<uint64_t>(engine.finalize_group(eh[g], scratch_e)));
+    }
+    rt.release();
+
+    MedianStore<T>        e1;
+    wb_rt::MedianStore<T> r1;
+    MedianHandle          h1;
+    wb_rt::MedianHandle   h2;
+    for (int i = 0; i < 100'000; ++i) {
+        const T v = rt_random_value<T>(state);
+        e1.append(h1, v);
+        r1.append(h2, v);
+    }
+    CHECK_EQ(std::bit_cast<uint64_t>(r1.finalize_single(h2)), std::bit_cast<uint64_t>(e1.finalize_single(h1)));
+    r1.release();
+}
+}  // namespace
+
+TEST(runtime_median_store_matches_vectorized) {
+    check_runtime_median_store<double>();
+    check_runtime_median_store<float>();
+    check_runtime_median_store<int64_t>();
 }
 
 TEST(runtime_join_matches_engine) {
@@ -566,4 +571,36 @@ TEST(cg_median_signed_zeros_and_nan_payloads) {
     auto t = make_kv_double(signed_zero_median_rows(), 3);
     check_engines_agree(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}}));
     check_engines_agree(*aggregate(scan(*t, {0, 1}), std::nullopt, {{AggFn::Median, 1}}));
+}
+
+TEST(cg_median_block_boundaries) {
+    fresh_cache_dir();
+    auto t = make_kv_double(median_boundary_rows(), 300);
+    check_engines_agree(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(cg_int64_min_key_with_median) {
+    fresh_cache_dir();
+    auto t = make_kv_double(int64_min_median_rows(), 128);
+    check_engines_agree(*aggregate(scan(*t, {0, 1}), 0, {{AggFn::Sum, 1}, {AggFn::Median, 1}, {AggFn::Count, std::nullopt}}));
+}
+
+TEST(cg_many_int128_fields) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000);
+    check_engines_agree(*aggregate(scan(*t, {0, 1, 2}), 0,
+                                   {{AggFn::Sum, 0}, {AggFn::Avg, 0}, {AggFn::Sum, 1}, {AggFn::Min, 2},
+                                    {AggFn::Count, std::nullopt}}));
+}
+
+TEST(cg_median_narrow_float_scan_and_join) {
+    fresh_cache_dir();
+    auto t = make_readings(50'000, 8'000, /*narrow_float=*/true);
+    check_engines_agree(*aggregate(scan(*t, {0, 2}), 0, {{AggFn::Median, 1}}));
+    check_engines_agree(*aggregate(scan(*t, {2}), std::nullopt, {{AggFn::Median, 0}}));
+    // Narrow table on both sides of a join: probe column 2 is a scan column, build column 4 comes
+    // out of the join table as double.
+    auto devices = make_readings(2'000, 500, /*narrow_float=*/true);
+    check_engines_agree(*aggregate(join(scan(*t, {0, 2}), scan(*devices, {0, 2}), 0, 0), 0,
+                                   {{AggFn::Median, 1}, {AggFn::Median, 3}}));
 }
