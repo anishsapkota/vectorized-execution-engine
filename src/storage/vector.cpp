@@ -66,6 +66,16 @@ Int64Raw Int64Vector::raw() const {
         codes_);
 }
 
+int64_t* Int64Vector::reset_plain(std::size_t n) {
+    if (!std::holds_alternative<std::vector<uint64_t>>(codes_)) codes_ = std::vector<uint64_t>{};
+    auto& codes = std::get<std::vector<uint64_t>>(codes_);
+    codes.resize(n);
+    base_ = 0;
+    size_ = n;
+    // int64_t and uint64_t may alias; with base 0, decode(code) is the stored int64 value.
+    return reinterpret_cast<int64_t*>(codes.data());
+}
+
 Float64Vector::Float64Vector(std::vector<double> values, bool narrow) {
     if (!narrow) {
         values_ = std::move(values);
@@ -86,6 +96,13 @@ std::size_t Float64Vector::memory_bytes() const {
 Float64Raw Float64Vector::raw() const {
     return std::visit([&](const auto& values) { return Float64Raw{values.data(), narrow()}; },
                       values_);
+}
+
+double* Float64Vector::reset(std::size_t n) {
+    if (!std::holds_alternative<std::vector<double>>(values_)) values_ = std::vector<double>{};
+    auto& values = std::get<std::vector<double>>(values_);
+    values.resize(n);
+    return values.data();
 }
 
 double Float64Vector::value(std::size_t i) const {

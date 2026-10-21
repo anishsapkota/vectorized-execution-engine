@@ -70,6 +70,11 @@ class Int64Vector final : public Vector {
 
     Int64Raw raw() const;
 
+    // For operator-owned output vectors only: turn this into an unencoded column of n values
+    // (width 8, base 0, so decoding is the identity) and return its storage for writing. Keeps
+    // the existing capacity, so refilling a batch-sized output column allocates nothing.
+    int64_t* reset_plain(std::size_t n);
+
    private:
     std::variant<std::vector<uint8_t>, std::vector<uint16_t>, std::vector<uint32_t>,
                  std::vector<uint64_t>>
@@ -102,6 +107,10 @@ class Float64Vector final : public Vector {
     double value(std::size_t i) const;
 
     Float64Raw raw() const;
+
+    // For operator-owned output vectors only: turn this into a double column of n values and
+    // return its storage for writing. Keeps the existing capacity.
+    double* reset(std::size_t n);
 
    private:
     std::variant<std::vector<double>, std::vector<float>> values_;
