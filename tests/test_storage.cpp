@@ -204,4 +204,24 @@ TEST(csv) {
 TEST(chained_filters_f64) { check_chained_filters(false); }
 TEST(chained_filters_f32) { check_chained_filters(true); }
 
+TEST(raw_accessors) {
+    std::vector<int64_t> ints{-5, 70'000};
+    Int64Vector          v{ints};
+    CHECK(v.raw().width == 4);
+    CHECK(v.raw().base == -5);
+    CHECK(static_cast<const uint32_t*>(v.raw().codes)[1] == 70'005);
+
+    Float64Vector f{{1.5, 2.5}, true};
+    CHECK(f.raw().narrow);
+    CHECK(static_cast<const float*>(f.raw().values)[1] == 2.5f);
+}
+
+TEST(scan_start_row_public) {
+    const std::vector<IndexEntry> idx{{100, 0}, {200, 1024}, {300, 2048}};
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Gt, int64_t{250}}) == 1024);
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Eq, int64_t{100}}) == 0);
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Lt, int64_t{250}}) == 0);
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Ge, int64_t{99}}) == 0);
+}
+
 }  // namespace

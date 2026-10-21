@@ -58,6 +58,14 @@ int64_t Int64Vector::value(std::size_t i) const {
     return std::visit([&](const auto& codes) { return decode(base_, codes[i]); }, codes_);
 }
 
+Int64Raw Int64Vector::raw() const {
+    return std::visit(
+        [&](const auto& codes) {
+            return Int64Raw{codes.data(), base_, static_cast<std::uint8_t>(sizeof(codes[0]))};
+        },
+        codes_);
+}
+
 Float64Vector::Float64Vector(std::vector<double> values, bool narrow) {
     if (!narrow) {
         values_ = std::move(values);
@@ -73,6 +81,11 @@ std::size_t Float64Vector::size() const {
 std::size_t Float64Vector::memory_bytes() const {
     return std::visit(
         [](const auto& values) { return values.capacity() * sizeof(values[0]); }, values_);
+}
+
+Float64Raw Float64Vector::raw() const {
+    return std::visit([&](const auto& values) { return Float64Raw{values.data(), narrow()}; },
+                      values_);
 }
 
 double Float64Vector::value(std::size_t i) const {

@@ -24,6 +24,19 @@ class Vector {
     virtual std::size_t memory_bytes() const = 0;
 };
 
+// Untyped view of a column's storage, for code that cannot use visit() (the codegen host binds
+// these pointers into generated code).
+struct Int64Raw {
+    const void*  codes;  // width-byte unsigned codes; value = base + code
+    int64_t      base;
+    std::uint8_t width;  // 1, 2, 4 or 8
+};
+
+struct Float64Raw {
+    const void* values;  // float if narrow, else double
+    bool        narrow;
+};
+
 // Frame-of-reference encoded int64 column. Stores `value - base` (base = column minimum) in the
 // narrowest unsigned width that holds the column's range: 1, 2, 4 or 8 bytes per value.
 // Kernels read through visit(), which hands them the typed code array once per batch so the
@@ -55,6 +68,8 @@ class Int64Vector final : public Vector {
     // Scalar access, for cold paths. Hot loops should use visit().
     int64_t value(std::size_t i) const;
 
+    Int64Raw raw() const;
+
    private:
     std::variant<std::vector<uint8_t>, std::vector<uint16_t>, std::vector<uint32_t>,
                  std::vector<uint64_t>>
@@ -85,6 +100,8 @@ class Float64Vector final : public Vector {
 
     // Scalar access, for cold paths. Hot loops should use visit().
     double value(std::size_t i) const;
+
+    Float64Raw raw() const;
 
    private:
     std::variant<std::vector<double>, std::vector<float>> values_;

@@ -2,7 +2,8 @@ CXX := g++
 CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -O3 -march=native -g -Isrc -pthread -MMD -MP
 LDFLAGS :=
 
-LIB_SRC := $(wildcard src/storage/*.cpp) $(wildcard src/exec/*.cpp) $(wildcard src/dist/*.cpp)
+LIB_SRC := $(wildcard src/storage/*.cpp) $(wildcard src/exec/*.cpp) $(wildcard src/dist/*.cpp) \
+           $(wildcard src/plan/*.cpp) $(wildcard src/codegen/*.cpp)
 SRC := $(LIB_SRC) src/main.cpp
 OBJ := $(SRC:.cpp=.o)
 BIN := wb

@@ -11,3 +11,4 @@
 # Generated data and codegen cache
 /data/readings.csv
 /.wb_cache/
+/.superpowers/

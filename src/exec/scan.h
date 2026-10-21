@@ -9,6 +9,10 @@
 
 namespace wb {
 
+// First row worth scanning in a segment sorted on pred's column, using the sparse primary index.
+// Shared by ScanOperator and the codegen host so both engines read identical row ranges.
+std::size_t scan_start_row(const std::vector<IndexEntry>& idx, const Predicate& pred);
+
 class ScanOperator final : public Operator {
    public:
     // Scan a table; if predicate is set, prune segments whose zone map proves

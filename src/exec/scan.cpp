@@ -4,9 +4,7 @@
 
 namespace wb {
 
-namespace {
-
-std::size_t find_starting_row_(const std::vector<IndexEntry>& idx, const Predicate& pred) {
+std::size_t scan_start_row(const std::vector<IndexEntry>& idx, const Predicate& pred) {
     int64_t value = std::get<int64_t>(pred.value);  // sort key is int64
 
     switch (pred.op) {
@@ -38,7 +36,6 @@ std::size_t find_starting_row_(const std::vector<IndexEntry>& idx, const Predica
     }
     return 0;
 }
-}  // namespace
 
 ScanOperator::ScanOperator(const Table& table, std::optional<Predicate> predicate,
                            std::uint32_t target_batch_size, std::vector<std::size_t> projected_cols)
@@ -72,7 +69,7 @@ std::optional<Batch> ScanOperator::next() {
             if (predicate_ && table_.sort_key_col() &&
                 *table_.sort_key_col() == predicate_->col_idx) {
                 const auto& idx = table_.segment(seg_idx_).primary_index();
-                if (!idx.empty()) row_idx_ = find_starting_row_(idx, *predicate_);
+                if (!idx.empty()) row_idx_ = scan_start_row(idx, *predicate_);
             }
 
             // Borrow pointers to projected columns only (or all if no projection). Batches
