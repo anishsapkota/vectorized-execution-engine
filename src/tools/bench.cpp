@@ -29,6 +29,7 @@
 #include "storage/csv.h"
 #include "storage/table.h"
 #include "storage/vector.h"
+#include "tools/allocator_info.h"
 
 // ---------------------------------------------------------------------------
 // Allocation counting: replace global operator new/delete. Every std::vector,
@@ -238,6 +239,7 @@ int main(int argc, char** argv) {
     }
     const std::size_t total_col = col_bytes[0] + col_bytes[1] + col_bytes[2];
 
+    std::printf("allocator: %s\n", allocator_name().c_str());
     std::printf("== load\n");
     std::printf("rows %zu  segments %zu  load %.0f ms  allocs %llu (%.2f/row)  alloc MiB %.1f\n",
                 rows, t.num_segments(),

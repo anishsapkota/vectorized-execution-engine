@@ -1,0 +1,8 @@
+q4 vec [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 0.1 MiB (0.0 B/row)
+q4 cg [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 1.0 MiB (0.1 B/row)
+q7 vec [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 99.6 MiB (10.4 B/row)
+q7 cg [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 99.1 MiB (10.4 B/row)
+q8 vec [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 85.1 MiB (8.9 B/row)
+q8 cg [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 85.1 MiB (8.9 B/row)
+q7f vec [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 57.0 MiB (6.0 B/row)
+q7f cg [jemalloc 5.4.0-0-g7a34f18502e7b222724097cdcd499b437d189acc] peak above loaded table: 56.5 MiB (5.9 B/row)

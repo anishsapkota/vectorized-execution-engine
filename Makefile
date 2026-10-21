@@ -6,6 +6,17 @@ ifneq ($(shell uname),Darwin)
 LDFLAGS += -ldl
 endif
 
+# ALLOCATOR=jemalloc links every binary against jemalloc (brew install jemalloc). Only the link
+# step differs, so switch with `make clean` first. Generated query libraries need no change: they
+# call malloc, which jemalloc serves once it registers as the default malloc zone.
+ALLOCATOR ?= system
+ifeq ($(ALLOCATOR),jemalloc)
+JEMALLOC_PREFIX ?= $(shell brew --prefix jemalloc 2>/dev/null)
+LDFLAGS += -L$(JEMALLOC_PREFIX)/lib -ljemalloc -Wl,-rpath,$(JEMALLOC_PREFIX)/lib
+else ifneq ($(ALLOCATOR),system)
+$(error ALLOCATOR must be system or jemalloc)
+endif
+
 LIB_SRC := $(wildcard src/storage/*.cpp) $(wildcard src/exec/*.cpp) $(wildcard src/dist/*.cpp) \
            $(wildcard src/plan/*.cpp) $(wildcard src/codegen/*.cpp)
 SRC := $(LIB_SRC) src/main.cpp

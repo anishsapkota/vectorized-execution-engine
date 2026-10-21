@@ -248,3 +248,40 @@ Two earlier conclusions change:
 The `wb_bench` checksums are unchanged except "groupby device MT": that total varies between runs
 (…0325672 / …03256726) because the parallel merge order depends on thread scheduling. That path
 was not touched by this work.
+
+## 8. Allocator comparison: system malloc vs jemalloc 5.4.0 (2026-10-21)
+
+`make ALLOCATOR=jemalloc` links every binary against Homebrew's jemalloc. It registers as the
+default malloc zone, so it also serves the dlopen'ed generated query libraries. That was checked:
+a separately built library's 100 MiB allocation appears in jemalloc's `stats.allocated`. Every tool
+prints the allocator it ran on. `bench/run_allocators.sh` reproduces everything below; raw output
+is in `bench/results/alloc/`. Both allocators: 112/112 tests, 18/18 compiled rows matching at 10M
+and at 100M rows.
+
+**Speed: no meaningful difference.** Every query is within ±5% at both sizes, for example:
+
+| Query | 100M vec | 100M cg-O3 |
+|---|---|---|
+| Q4 | 280 → 278 ms | 119 → 119 ms |
+| Q7 | 1633 → 1691 ms (+4%) | 1336 → 1370 ms (+3%) |
+| Q8 | 564 → 567 ms | 526 → 534 ms |
+
+The largest gap is Q8 cg at 10M (48.8 → 54.1 ms, +11%). This is expected: hot loops allocate
+nothing, and a query makes only tens to a few thousand allocations. The parallel group-by is
+slightly slower under jemalloc (100M: 33.0 → 35.6 ms; 10M: 4.15 → 4.49 ms).
+
+**Memory: jemalloc uses more.**
+
+| Measure | system | jemalloc |
+|---|---|---|
+| Q7 MEDIAN peak, 100M | 791 MiB | 883 MiB (+12%) |
+| Q8 MEDIAN peak, 100M | 768 MiB | 856 MiB (+11%) |
+| Q7 on `narrow_float`, 100M | 400 MiB | 447 MiB (+12%) |
+| Q7 MEDIAN peak, 10M | 89 MiB | 100 MiB (+12%) |
+| Process footprint after loading 100M rows | 1,255 MiB | 1,340 MiB (+7%) |
+
+`MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0` (return freed pages immediately) does not reduce
+these numbers, so the extra is not freed-page retention. Its cause was not determined.
+
+**Conclusion:** for this engine the system allocator stays the default. Allocation is off the hot
+path, so jemalloc buys no speed and costs 7–12% memory. The option remains for experiments.

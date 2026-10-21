@@ -20,6 +20,7 @@
 #include "plan/plan.h"
 #include "storage/csv.h"
 #include "storage/table.h"
+#include "tools/allocator_info.h"
 
 namespace {
 
@@ -91,7 +92,8 @@ int main(int argc, char** argv) {
         const Footprint after = footprint();
 
         const std::size_t extra = after.peak > before.now ? after.peak - before.now : 0;
-        std::printf("%s %s peak above loaded table: %.1f MiB (%.1f B/row)\n", query.c_str(), engine.c_str(),
+        std::printf("%s %s [%s] peak above loaded table: %.1f MiB (%.1f B/row)\n", query.c_str(), engine.c_str(),
+                    allocator_name().c_str(),
                     static_cast<double>(extra) / (1024.0 * 1024.0),
                     rows ? static_cast<double>(extra) / static_cast<double>(rows) : 0.0);
         return 0;

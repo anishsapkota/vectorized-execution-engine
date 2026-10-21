@@ -1,0 +1,13 @@
+allocator: system
+== load
+rows 10000000  segments 153  load 1117 ms  allocs 11339 (0.00/row)  alloc MiB 775.4
+== memory
+columns  device_id 19.1 MiB  ts 30.1 MiB  value 76.3 MiB  total 125.4 MiB (13.15 B/row)
+encoding seg0 widths  device_id 2 B  ts 4 B  value f64
+process  footprint after load 129.5 MiB (delta 128.3 MiB)  peak RSS 130.0 MiB
+== queries (iters=5, workers=11)
+ts>mid sum(value)      best      5224 us  median      5240 us  allocs/iter        7  alloc MiB/iter     0.02  | rows=5046926 count=0 sum=252392707.06520805
+ts>=min sum(value)     best     10353 us  median     10361 us  allocs/iter        7  alloc MiB/iter     0.02  | rows=10000000 count=0 sum=500023828.03256702
+value>50 sum(value)    best      6592 us  median      6628 us  allocs/iter        6  alloc MiB/iter     0.02  | rows=5002049 count=0 sum=309967343.4576
+groupby device 1T      best     28297 us  median     28466 us  allocs/iter       60  alloc MiB/iter     2.66  | rows=10000000 count=10000 sum=500023828.0325672
+groupby device MT      best      4150 us  median      4292 us  allocs/iter       46  alloc MiB/iter     8.25  | rows=10000000 count=10000 sum=500023828.0325672

@@ -20,6 +20,7 @@
 #include "plan/plan.h"
 #include "storage/csv.h"
 #include "storage/table.h"
+#include "tools/allocator_info.h"
 #include "tools/datagen.h"
 
 // Counts operator new calls (the engine's allocations). Generated code allocates its hash tables
@@ -155,6 +156,7 @@ int main(int argc, char** argv) {
         std::size_t rows = 0;
         for (const auto& seg : readings.segments())
             rows += seg->num_rows();
+        std::printf("allocator: %s\n", allocator_name().c_str());
         std::printf("readings %zu rows (%zu segments), orders %lld, customers %lld, iters %d, single-threaded\n", rows,
                     readings.num_segments(), static_cast<long long>(o.orders), static_cast<long long>(o.customers),
                     o.iters);
