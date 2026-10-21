@@ -5,6 +5,7 @@
 #include <limits>
 #include <bit>
 #include <map>
+#include <type_traits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "exec/group_index.h"
 #include "exec/group_slots.h"
+#include "exec/median_store.h"
 #include "exec/parallel_agg.h"
 #include "plan/lower_vec.h"
 #include "plan/plan.h"
@@ -667,4 +669,95 @@ TEST(group_slots_int128_alignment) {
     for (int64_t k = 0; k < 1'000; ++k)
         CHECK_EQ(reinterpret_cast<uintptr_t>(slots.find_or_insert(k * 13, fresh)) % 16, uintptr_t{0});
     CHECK_EQ(reinterpret_cast<uintptr_t>(slots.find_or_insert(INT64_MIN, fresh)) % 16, uintptr_t{0});
+}
+
+namespace {
+
+// The spec's MEDIAN total order, for any floating type: numbers ascending, -0 before +0, NaNs last
+// by bit pattern.
+template <typename T>
+bool total_less(T a, T b) {
+    if constexpr (std::is_floating_point_v<T>) {
+        using Bits      = std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>;
+        const bool a_nan = std::isnan(a), b_nan = std::isnan(b);
+        if (a_nan || b_nan) return !a_nan || (b_nan && std::bit_cast<Bits>(a) < std::bit_cast<Bits>(b));
+        return a < b || (a == b && std::signbit(a) && !std::signbit(b));
+    } else {
+        return a < b;
+    }
+}
+
+template <typename T>
+double sorted_median(std::vector<T> v) {
+    std::sort(v.begin(), v.end(), total_less<T>);
+    const std::size_t n = v.size();
+    return n % 2 ? static_cast<double>(v[n / 2])
+                 : (static_cast<double>(v[n / 2 - 1]) + static_cast<double>(v[n / 2])) / 2.0;
+}
+
+template <typename T>
+T random_value(uint64_t& state) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    if constexpr (std::is_floating_point_v<T>) {
+        const uint64_t pick = state >> 58;
+        if (pick == 0) return std::numeric_limits<T>::quiet_NaN();
+        if (pick == 1) {
+            if constexpr (sizeof(T) == 8) return std::bit_cast<T>(uint64_t{0x7FF8000000000002ULL});
+            else return std::bit_cast<T>(uint32_t{0x7FC00002u});
+        }
+        if (pick == 2) return T{-0.0};
+        if (pick == 3) return T{0.0};
+        return static_cast<T>(static_cast<double>(state >> 40) / 64.0 - 100.0);
+    } else {
+        return static_cast<int64_t>(state >> 20) - (int64_t{1} << 43);
+    }
+}
+
+template <typename T>
+void check_median_store_matches_sort() {
+    std::vector<std::size_t> sizes{255, 256, 257, 513};
+    uint64_t                 state = 11;
+    for (int g = 0; g < 300; ++g)
+        sizes.push_back(1 + static_cast<std::size_t>((state = state * 6364136223846793005ULL + 1) >> 54) % 700);
+    MedianStore<T>               store;
+    std::vector<MedianHandle>    handles(sizes.size());
+    std::vector<std::vector<T>>  values(sizes.size());
+    for (std::size_t k = 0; k < 700; ++k) {  // interleave appends across groups, as rows arrive
+        for (std::size_t g = 0; g < sizes.size(); ++g) {
+            if (k >= sizes[g]) continue;
+            const T v = random_value<T>(state);
+            values[g].push_back(v);
+            store.append(handles[g], v);
+        }
+    }
+    std::vector<T> scratch;
+    for (std::size_t g = 0; g < sizes.size(); ++g) {
+        CHECK_EQ(handles[g].count, static_cast<uint32_t>(sizes[g]));
+        CHECK_EQ(std::bit_cast<uint64_t>(store.finalize_group(handles[g], scratch)),
+                 std::bit_cast<uint64_t>(sorted_median(values[g])));
+    }
+}
+
+}  // namespace
+
+TEST(median_store_matches_sort) {
+    check_median_store_matches_sort<double>();
+    check_median_store_matches_sort<float>();
+    check_median_store_matches_sort<int64_t>();
+}
+
+TEST(median_store_global_frees_chunks) {
+    MedianStore<double> store;
+    MedianHandle        h;
+    std::vector<double> values;
+    uint64_t            state = 3;
+    for (int i = 0; i < 1'000'000; ++i) {
+        const double v = random_value<double>(state);
+        values.push_back(v);
+        store.append(h, v);
+    }
+    CHECK(store.bytes_reserved() >= 1'000'000 * sizeof(double));
+    const double got = store.finalize_single(h);
+    CHECK_EQ(store.bytes_reserved(), std::size_t{0});
+    CHECK_EQ(std::bit_cast<uint64_t>(got), std::bit_cast<uint64_t>(sorted_median(values)));
 }
