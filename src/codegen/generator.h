@@ -28,7 +28,7 @@ std::vector<ScanBinding> bind_scans(const plan::Node& root);
 // 2k..2k+1).
 std::uint32_t width_sig(const ScanBinding& binding, const Segment& seg);
 
-// C++ source for a validated SumCount plan: one fused loop per pipeline (produce/consume),
+// C++ source for a validated Aggregate plan: one fused loop per pipeline (produce/consume),
 // specialized to each scan's width signatures. Exports wb_query and wb_abi_version.
 // Throws CodegenError for plans the generator does not support.
 std::string generate(const plan::Node& root, const std::vector<ScanBinding>& scans);

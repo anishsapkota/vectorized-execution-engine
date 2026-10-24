@@ -301,6 +301,15 @@
   <a href="#scan">Scan Operator</a>
   <a href="#filter">Filter Operator</a>
   <a href="#predicate">Predicates</a>
+  <a href="#hashagg">Hash Aggregation</a>
+  <a href="#median">MEDIAN Storage</a>
+  <a href="#hashjoin">Hash Join</a>
+
+  <div class="section-label">Query Layer</div>
+  <a href="#plan">Plan IR</a>
+  <a href="#codegen">Compiled Engine</a>
+  <a href="#parity">Engine Parity</a>
+  <a href="#dist">Distributed Layer</a>
 
   <div class="section-label">Optimizations</div>
   <a href="#pruning">Zone-Map Pruning</a>
@@ -320,20 +329,30 @@
 <section id="intro">
   <h1>wb — Columnar Engine Internals</h1>
   <p class="subtitle">A from-scratch columnar analytical database written in C++20.<br>
-  Covers storage layout, execution model, pruning, and vectorized filtering.</p>
+  Covers storage layout and encoding, execution model, pruning, vectorized filtering,
+  aggregation, joins, and a compiled (codegen) engine that runs the same plans.</p>
 
   <p>
     <strong>wb</strong> is a minimal but realistic columnar query engine. It ingests CSV data
-    into immutable column-oriented segments, attaches min/max zone maps for pruning,
-    and executes queries as a pipeline of pull-based operators that pass
+    into immutable column-oriented segments, attaches min/max zone maps and a sparse primary
+    index for pruning, and executes queries as a pipeline of pull-based operators that pass
     <em>batches</em> of row indices rather than materialising rows.
+  </p>
+
+  <p>
+    Queries are written as a small logical plan (Scan / Filter / HashJoin / Aggregate). The same
+    plan runs on two engines: the <strong>vectorized</strong> operator pipeline
+    (<code>run_vectorized</code>) and a HyPer-style <strong>compiled</strong> engine that
+    generates C++, compiles it with clang and loads it with <code>dlopen</code>
+    (<code>run_compiled</code>). The two must return bit-identical results.
   </p>
 
   <div class="card-grid">
     <div class="card">
       <h4>Storage model</h4>
-      <p style="margin:0;font-size:13px">Column-per-file layout within segments. Each column is a typed
-      contiguous array (<code>std::vector&lt;T&gt;</code>). No row materialisation.</p>
+      <p style="margin:0;font-size:13px">Columns grouped into immutable segments. Int64 columns are
+      frame-of-reference encoded in 1/2/4/8-byte codes; Float64 columns store <code>double</code>
+      (or <code>float</code> on opt-in). No row materialisation.</p>
     </div>
     <div class="card">
       <h4>Execution model</h4>
@@ -347,8 +366,19 @@
     </div>
     <div class="card">
       <h4>Filtering</h4>
-      <p style="margin:0;font-size:13px">Template kernels with <code>std::greater&lt;&gt;</code>
-      et al. baked in at compile time. Dispatch happens once per batch, not once per row.</p>
+      <p style="margin:0;font-size:13px">Branchless template kernels with <code>std::greater&lt;&gt;</code>
+      et al. baked in at compile time. Dispatch on type × encoding × operator happens once per
+      batch, not once per row.</p>
+    </div>
+    <div class="card">
+      <h4>Aggregation &amp; joins</h4>
+      <p style="margin:0;font-size:13px">Hash aggregation (COUNT, SUM, MIN, MAX, AVG, exact MEDIAN)
+      with group state inline in hash slots, and an inner equi-join on one int64 key.</p>
+    </div>
+    <div class="card">
+      <h4>Compiled engine</h4>
+      <p style="margin:0;font-size:13px">Produce/consume code generation into one fused loop per
+      pipeline, specialised per encoding width, cached on disk by an FNV-1a key.</p>
     </div>
   </div>
 </section>
@@ -361,22 +391,57 @@
     <span class="dir">src/</span><br>
     &nbsp;&nbsp;<span class="dir">storage/</span>&nbsp;&nbsp;&nbsp;<span class="note">← persistent data layer</span><br>
     &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">schema.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">DataType enum, ColumnDef, Schema alias</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">vector.h/cpp</span>&nbsp;&nbsp;<span class="note">Int64Vector, Float64Vector, StringVector</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">vector.h/cpp</span>&nbsp;&nbsp;<span class="note">Int64Vector (frame-of-reference), Float64Vector (double/float), StringVector</span><br>
     &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">zone_map.h/cpp</span>&nbsp;<span class="note">min/max statistics per column</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">segment.h/cpp</span>&nbsp;&nbsp;<span class="note">immutable Segment + SegmentBuilder</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">table.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">ordered collection of segments</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">segment.h/cpp</span>&nbsp;&nbsp;<span class="note">immutable Segment + SegmentBuilder (sort, encode, sparse index at seal)</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">table.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">ordered collection of segments + optional sort key</span><br>
     &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">csv.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">streaming CSV → Table loader</span><br>
-    &nbsp;&nbsp;<span class="dir">exec/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">← query execution layer</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">operator.h</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">Operator base class + ScanRow struct</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">batch.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">non-owning Batch view (columns + sel vector)</span><br>
+    &nbsp;&nbsp;<span class="dir">exec/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">← vectorized execution layer</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">operator.h</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">Operator base class</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">batch.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">non-owning Batch view (column span + sel span), for_each_live_row</span><br>
     &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">predicate.h/cpp</span>&nbsp;<span class="note">CompareOp enum, Predicate struct, zone_map_can_match()</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">scan.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">ScanOperator — segment iteration + pruning</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">filter.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">FilterOperator — vectorized row selection</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">scan.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">ScanOperator — pruning + scan_start_row (shared with codegen)</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">filter.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">FilterOperator — branchless row selection</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">agg_spec.h</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">AggKind enum + AggSpec</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">hashagg.h/cpp</span>&nbsp;&nbsp;<span class="note">HashAggOperator — GROUP BY / global aggregates</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">group_slots.h/cpp</span>&nbsp;<span class="note">int64 key → inline state block hash table</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">median_store.h</span>&nbsp;<span class="note">block-chained MEDIAN values + median_less + introselect</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">hash_join.h/cpp</span>&nbsp;<span class="note">HashJoinOperator — inner equi-join on one int64 key</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">hash_table.h/cpp</span>&nbsp;<span class="note">AggHashTable (key → {sum, count}), used by the parallel path</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">agg_kernel.h</span>&nbsp;&nbsp;<span class="note">accumulate_sum_count kernel</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">parallel_agg.h/cpp</span>&nbsp;<span class="note">multi-threaded GROUP BY SUM/COUNT, one segment per claim</span><br>
+    &nbsp;&nbsp;<span class="dir">plan/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">← logical plan shared by both engines</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">plan.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">Scan / Filter / HashJoin / Aggregate nodes, validation, to_string</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">result.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">QueryResult — exact comparison, checksum, NULL row</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">lower_vec.h/cpp</span>&nbsp;<span class="note">run_vectorized — plan → operator tree</span><br>
+    &nbsp;&nbsp;<span class="dir">codegen/</span>&nbsp;&nbsp;&nbsp;<span class="note">← compiled engine</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">generator.h/cpp</span>&nbsp;<span class="note">plan → C++ source (produce/consume), scan bindings, width signatures</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">compiler.h/cpp</span>&nbsp;<span class="note">clang invocation, dlopen, in-memory + on-disk cache</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">host.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">prepare / execute / run_compiled</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">runtime.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">ABI structs, GroupRows, MedianStore, JoinTable (no STL)</span><br>
+    &nbsp;&nbsp;<span class="dir">dist/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">← simulated Redshift cluster</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">chunk.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">owned Chunk + ChunkBuilder (rows that outlive a batch)</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">cluster.h/cpp</span>&nbsp;&nbsp;<span class="note">nodes × slices, DISTSTYLE (EVEN / KEY / ALL), slice_for_key</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">distribute.h/cpp</span>&nbsp;<span class="note">loader that spreads a table over slices</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">exchange.h/cpp</span>&nbsp;<span class="note">redistribute / broadcast between slices</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">stream.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">run_stream — one thread per slice, barrier per stream</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">network.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">NetworkStats — bytes moved between slices</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">planner.h/cpp</span>&nbsp;&nbsp;<span class="note">DS_* join strategies + cheapest-movement rule</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">dist_join.h/cpp</span>&nbsp;<span class="note">distributed join execution with a fixed strategy</span><br>
     &nbsp;&nbsp;<span class="dir">tools/</span><br>
-    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">gen.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">10M-row sensor readings CSV generator</span><br>
-    &nbsp;&nbsp;<span class="file">main.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">integration tests + benchmark harness</span><br>
-    <span class="dir">data/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">readings.csv, bigger.csv, test.csv</span><br>
-    <span class="file">Makefile</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">-O3 -march=native, separate wb / wb_gen / wb_test targets</span>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">gen.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">wb_gen — sensor readings CSV generator</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">bench.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">wb_bench — load time, footprint, allocations, query latency</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">codegen_bench.cpp</span>&nbsp;<span class="note">wb_codegen — vectorized vs compiled, bit-for-bit check</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">dist_bench.cpp</span>&nbsp;<span class="note">wb_dist — distributed join experiments</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">mem_probe.cpp</span>&nbsp;&nbsp;<span class="note">wb_mem — peak memory of one query on one engine</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">datagen.h</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">synthetic orders / customers tables</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">allocator_info.h</span>&nbsp;<span class="note">reports system malloc vs jemalloc</span><br>
+    &nbsp;&nbsp;<span class="file">main.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">wb — demo driver: load readings, time filter+sum and group-by</span><br>
+    &nbsp;&nbsp;<span class="file">todo.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">exception type for deliberately unimplemented stubs</span><br>
+    <span class="dir">tests/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">wb_test — test_storage, test_plan, test_codegen, test_dist</span><br>
+    <span class="dir">bench/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">run_allocators.sh, results/ (raw benchmark output)</span><br>
+    <span class="dir">data/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">readings.csv, readings-100m.csv, small.csv, test.csv</span><br>
+    <span class="file">Makefile</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">-O3 -march=native; wb / wb_test / wb_gen / wb_bench / wb_codegen / wb_dist / wb_mem; ALLOCATOR=jemalloc</span>
   </div>
 </section>
 
@@ -394,26 +459,30 @@
       ▼
   <span class="box2">load_csv()</span> ──splits──► <span class="box">SegmentBuilder</span> ──seal()──► <span class="box">Segment</span>
                               │                          │
-                              │  append_int64()          ├─ columns_[0]  <span class="box2">Int64Vector</span>   [ts]
-                              │  append_float64()        ├─ columns_[1]  <span class="box2">Float64Vector</span> [value]
-                              │  ...per column           └─ zones_[i]    <span class="box3">ZoneMap</span>   min/max
-                              │
+                              │  append_int64()          ├─ columns_[i]  <span class="box2">Int64Vector</span>   FOR codes [ts]
+                              │  append_float64()        ├─ columns_[j]  <span class="box2">Float64Vector</span> [value]
+                              │  (raw buffers)           ├─ zones_[i]    <span class="box3">ZoneMap</span>   min/max
+                              │                          └─ primary_index_  (key, row) every 8,192 rows
+                              │  seal(): sort by key, encode, index
                    65,536 rows per segment
                               │
   ┌───────────────────────────▼───────────────────────────┐
   │                       <span class="box">Table</span>                          │
   │   segments_[0]  segments_[1]  ...  segments_[152]     │
   └────────────────────────┬──────────────────────────────┘
-                           │  query: ts > cutoff
+                           │  plan: Aggregate(Filter(Scan))
+              ┌────────────┴─────────────┐
+              ▼                          ▼
+       <span class="box2">run_vectorized()</span>            <span class="box2">run_compiled()</span>
+              │                          │
+     <span class="box">ScanOperator</span>  prune +         generate C++ ─► clang ─► dlopen
+              │  scan_start_row          │  (same pruning, same start row)
+     <span class="box">FilterOperator</span>  sel vector       │
+              │                          │  one fused loop per pipeline
+     <span class="box">HashAggOperator</span>                  │
+              └────────────┬─────────────┘
                            ▼
-                  <span class="box">ScanOperator</span>  ─zone-map-prune──► skip 75 segments
-                           │  emit Batch{col_ptrs, offset, size}
-                           ▼
-                 <span class="box">FilterOperator</span>  ──apply predicate──► set sel vector
-                           │
-                           ▼
-                      caller loop
-                    sum(value) over sel
+                   <span class="box3">QueryResult</span>  (must match bit for bit)
   </div>
 </section>
 
@@ -430,12 +499,22 @@
     <span class="nm">String</span>,   <span class="cm">// heap-allocated std::string</span>
 };
 
-<span class="kw">struct</span> <span class="ty">ColumnDef</span> { std::string name; <span class="ty">DataType</span> type; };
+<span class="kw">struct</span> <span class="ty">ColumnDef</span> {
+    std::string name;
+    <span class="ty">DataType</span>    type;
+    <span class="ty">bool</span>        narrow_float = <span class="nm">false</span>;  <span class="cm">// Float64 only: store as float (lossy, opt-in)</span>
+};
 <span class="kw">using</span> <span class="ty">Schema</span> = std::vector&lt;<span class="ty">ColumnDef</span>&gt;;</code></pre>
 
   <p>A <code>Schema</code> is just an ordered list of column definitions. Every object in the engine
   that is aware of column types receives a <code>Schema</code> — the builder, the loader, and any
-  operator that needs to downcast a <code>Vector*</code>.</p>
+  operator that needs to downcast a <code>Vector*</code>. <code>narrow_float</code> changes only
+  the <em>storage</em> of a Float64 column; its logical type and every read stay
+  <code>double</code>. It is exact only for inputs with at most 6 significant decimal digits.</p>
+
+  <p>The plan layer and the compiled engine accept only Int64 and Float64 columns
+  (<code>plan::output_types</code> rejects String); String columns remain usable by
+  <code>ScanOperator</code> and <code>FilterOperator</code> directly.</p>
 
   <div class="callout">
     <strong>Why only three types?</strong>
@@ -447,27 +526,71 @@
 
 <section id="vectors">
   <h2>Column Vectors</h2>
-  <p>Each column type gets a concrete class that owns a <code>std::vector&lt;T&gt;</code> and
-  exposes a <code>std::span&lt;const T&gt;</code> for zero-copy read access:</p>
+  <p>Each column type gets a concrete class. Columns are <strong>immutable once constructed</strong>:
+  there is no <code>append()</code>. <code>SegmentBuilder</code> buffers raw values and builds
+  the encoded column in <code>seal()</code>.</p>
 
   <div class="diagram" style="font-size:13px">
-  <span style="color:var(--muted)">/* Abstract base — no data, only type/size contract */</span>
-  <span class="box2">Vector</span>  { type() → DataType,  size() → size_t }
+  <span style="color:var(--muted)">/* Abstract base — no data, only type/size/footprint contract */</span>
+  <span class="box2">Vector</span>  { type() → DataType,  size() → size_t,  memory_bytes() → size_t }
        │
-       ├─ <span class="box">Int64Vector</span>   values_: vector&lt;int64_t&gt;   append(int64_t)  data() → span&lt;const int64_t&gt;
-       ├─ <span class="box">Float64Vector</span> values_: vector&lt;double&gt;    append(double)   data() → span&lt;const double&gt;
-       └─ <span class="box">StringVector</span>  values_: vector&lt;string&gt;    append(string)   data() → span&lt;const string&gt;
+       ├─ <span class="box">Int64Vector</span>   codes_: variant&lt;vector&lt;uint8_t|uint16_t|uint32_t|uint64_t&gt;&gt;, base_
+       │                 visit(f) → f(span&lt;const UInt&gt; codes, int64_t base)
+       ├─ <span class="box">Float64Vector</span> values_: variant&lt;vector&lt;double&gt;, vector&lt;float&gt;&gt;
+       │                 visit(f) → f(span&lt;const double&gt;) or f(span&lt;const float&gt;)
+       └─ <span class="box">StringVector</span>  values_: vector&lt;string&gt;    data() → const vector&lt;string&gt;&amp;
   </div>
 
-  <p>Operators receive a <code>const Vector&amp;</code> via the <code>Batch</code> API. When a kernel
-  needs raw data it downcasts:</p>
-<pre><code><span class="kw">auto</span> data = <span class="kw">static_cast</span>&lt;<span class="kw">const</span> <span class="ty">Int64Vector</span>&amp;&gt;(col).<span class="fn">data</span>(); <span class="cm">// span&lt;const int64_t&gt;</span>
-<span class="ty">int64_t</span> val = data[row_index];  <span class="cm">// O(1), no bounds check in release</span></code></pre>
+  <h4>Int64: frame-of-reference encoding</h4>
+  <p><code>Int64Vector</code> stores <code>value − base</code>, where <code>base</code> is the
+  column's minimum within the segment, in the narrowest unsigned width that holds the column's
+  range: 1, 2, 4 or 8 bytes per value. Decoding is a widen-and-add, done as an unsigned add so a
+  range that needs all 64 bits wraps instead of overflowing:</p>
+
+  <table>
+    <tr><th>Segment range (max − min)</th><th>Code type</th><th>Bytes / value</th></tr>
+    <tr><td>≤ 255</td><td><code>uint8_t</code></td><td>1</td></tr>
+    <tr><td>≤ 65,535</td><td><code>uint16_t</code></td><td>2</td></tr>
+    <tr><td>≤ 4,294,967,295</td><td><code>uint32_t</code></td><td>4</td></tr>
+    <tr><td>anything larger</td><td><code>uint64_t</code></td><td>8</td></tr>
+  </table>
+
+<pre><code><span class="kw">template</span> &lt;<span class="kw">typename</span> Code&gt;
+<span class="kw">static</span> <span class="ty">int64_t</span> <span class="fn">decode</span>(<span class="ty">int64_t</span> base, Code code) {
+    <span class="kw">return static_cast</span>&lt;<span class="ty">int64_t</span>&gt;(<span class="kw">static_cast</span>&lt;<span class="ty">uint64_t</span>&gt;(base) + code);
+}</code></pre>
+
+  <p>Hot loops never decode through a virtual call or a per-row switch. They call
+  <code>visit()</code>, which resolves the width once per batch and hands the kernel a typed code
+  array, so the inner loop is specialised for one width:</p>
+<pre><code><span class="kw">static_cast</span>&lt;<span class="kw">const</span> <span class="ty">Int64Vector</span>&amp;&gt;(col).<span class="fn">visit</span>([&amp;](<span class="kw">auto</span> codes, <span class="ty">int64_t</span> base) {
+    <span class="kw">for</span> (<span class="ty">uint32_t</span> i : rows)
+        sum += <span class="ty">Int64Vector</span>::<span class="fn">decode</span>(base, codes[i]);   <span class="cm">// codes: span&lt;const uint16_t&gt;, say</span>
+});</code></pre>
+
+  <p><code>value(i)</code> gives scalar access for cold paths, and <code>raw()</code> returns an
+  untyped <code>{codes, base, width}</code> view that the compiled engine binds into generated
+  code.</p>
+
+  <h4>Float64: double, or float on opt-in</h4>
+  <p><code>Float64Vector</code> stores <code>double</code>, or <code>float</code> when the
+  column's <code>ColumnDef::narrow_float</code> is set. Reads always widen to <code>double</code>.
+  Narrow storage halves the column but is lossy in general, so it is never chosen
+  automatically.</p>
+
+  <h4>Operator-owned output vectors</h4>
+  <p>Two mutators exist, for operator-owned output columns only:
+  <code>Int64Vector::reset_plain(n)</code> turns the vector into an unencoded column (width 8,
+  base 0, so decoding is the identity) and <code>Float64Vector::reset(n)</code> into a
+  <code>double</code> column. Both keep the existing capacity, so refilling a batch-sized output
+  column allocates nothing. <code>HashJoinOperator</code> uses them; segment columns are never
+  reset.</p>
 
   <div class="callout warn">
     <strong>Downcast safety</strong>
-    The cast is safe only when the caller already checked <code>col.type() == DataType::Int64</code>.
-    Both the filter kernel dispatch and the benchmark sum loop do this check first.
+    The <code>static_cast</code> to a concrete vector is safe only when the caller already checked
+    <code>col.type()</code> (or the plan was validated, which fixes every column's type).
+    The filter dispatch switches on <code>col.type()</code> first.
     An unchecked downcast to the wrong type is undefined behaviour.
   </div>
 </section>
@@ -476,7 +599,10 @@
   <h2>Zone Maps</h2>
   <p>Every column in every segment carries one <code>ZoneMap</code> — the exact min and max value
   observed. Zone maps are updated during <code>SegmentBuilder::append_*</code> and frozen at
-  <code>seal()</code> time. They never change after that.</p>
+  <code>seal()</code> time. They never change after that. One exception at seal: for a
+  <code>narrow_float</code> column, rounding to <code>float</code> can move a value past the
+  double min/max, so <code>seal()</code> rebuilds that zone map from the stored values. Pruning
+  then agrees with what the filter actually reads.</p>
 
 <pre><code><span class="kw">class</span> <span class="ty">ZoneMap</span> {
     <span class="ty">bool</span>     has_values_ = <span class="nm">false</span>;
@@ -511,27 +637,46 @@
 
 <section id="segments">
   <h2>Segments &amp; SegmentBuilder</h2>
-  <p>A <code>Segment</code> is <strong>immutable</strong> after creation. It owns its column vectors
-  and zone maps via <code>std::unique_ptr</code> and moves them in from the builder at seal time.</p>
+  <p>A <code>Segment</code> is <strong>immutable</strong> after creation. It owns its encoded
+  column vectors (via <code>std::unique_ptr</code>), one zone map per column, and a sparse
+  primary index. The builder constructs all of them at seal time and moves them in.</p>
 
   <div class="diagram" style="font-size:13px">
   <span class="box">Segment</span>
     │  num_rows_   = 65,536
     │
-    ├─ columns_[0]  → <span class="box2">Int64Vector</span>    [ts₀, ts₁, ..., ts₆₅₅₃₅]
-    ├─ columns_[1]  → <span class="box2">Float64Vector</span>  [v₀,  v₁,  ...,  v₆₅₅₃₅]
+    ├─ columns_[0]  → <span class="box2">Int64Vector</span>    base=ts_min, codes [ts₀−base, ..., ts₆₅₅₃₅−base]
+    ├─ columns_[1]  → <span class="box2">Float64Vector</span>  [v₀,  v₁,  ...,  v₆₅₅₃₅]   (double, or float if narrow)
     │
     ├─ zones_[0]    → <span class="box3">ZoneMap</span>  Int64   min=1700000000  max=1700065536
-    └─ zones_[1]    → <span class="box3">ZoneMap</span>  Float64 min=5.1          max=94.9
+    ├─ zones_[1]    → <span class="box3">ZoneMap</span>  Float64 min=5.1          max=94.9
+    │
+    └─ primary_index_ → [{key@row 0, 0}, {key@row 8192, 8192}, ...]   (only if the table has a sort key)
   </div>
 
-  <p><code>SegmentBuilder</code> manages the mutable accumulation phase:</p>
+  <p><code>SegmentBuilder</code> manages the mutable accumulation phase. It holds one
+  <em>raw</em> buffer per column (<code>vector&lt;int64_t&gt;</code>,
+  <code>vector&lt;double&gt;</code> or <code>vector&lt;string&gt;</code>) and does no encoding
+  until <code>seal()</code>:</p>
 
 <pre><code><span class="ty">SegmentBuilder</span> b{schema};
 b.<span class="fn">append_int64</span>(<span class="nm">0</span>, ts);         <span class="cm">// col 0, col 1 must alternate to form rows</span>
 b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <span class="cm">// num_rows_ increments on col 0 append</span>
 <span class="cm">// ... 65,535 more rows ...</span>
-<span class="kw">auto</span> seg = b.<span class="fn">seal</span>();            <span class="cm">// unique_ptr&lt;Segment&gt;; builder is exhausted</span></code></pre>
+<span class="kw">auto</span> seg = b.<span class="fn">seal</span>(table.<span class="fn">sort_key_col</span>(), <span class="cm">/*granule_size=*/</span><span class="nm">8192</span>);  <span class="cm">// builder left empty</span></code></pre>
+
+  <h4>What seal() does</h4>
+  <ol style="margin:0 0 14px 20px;line-height:2">
+    <li>Asserts every column buffer has <code>num_rows_</code> values.</li>
+    <li>If there is a sort key (it must be Int64): computes a permutation that sorts rows by the
+    key, applies it to every column buffer in lockstep, and records one
+    <code>IndexEntry{sort_key_value, row_offset}</code> per granule of <code>granule_size</code>
+    rows. This is the sparse primary index.</li>
+    <li>Encodes each buffer into its immutable column: frame-of-reference for Int64,
+    double/float for Float64, moved strings for String.</li>
+    <li>For narrow Float64 columns, rebuilds the zone map from the stored floats.</li>
+  </ol>
+  <p>Sorting is per segment only. Segments are not merged or re-sorted against each other.</p>
 
   <div class="callout">
     <strong>Row counting convention</strong>
@@ -555,40 +700,55 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
   via <code>unique_ptr</code> and never reorders or merges them.</p>
 
 <pre><code><span class="kw">class</span> <span class="ty">Table</span> {
+    std::optional&lt;std::size_t&gt;            sort_key_col_;  <span class="cm">// Int64 column sorted within each segment</span>
     std::string                           name_;
     <span class="ty">Schema</span>                                schema_;
     std::vector&lt;std::unique_ptr&lt;<span class="ty">Segment</span>&gt;&gt; segments_;
 <span class="kw">public</span>:
+    <span class="ty">Table</span>(std::string name, <span class="ty">Schema</span> schema, std::optional&lt;std::size_t&gt; sort_key_col = std::nullopt);
     <span class="kw">void</span>             <span class="fn">add_segment</span>(std::unique_ptr&lt;<span class="ty">Segment</span>&gt;);
     <span class="kw">const</span> <span class="ty">Segment</span>&amp;  <span class="fn">segment</span>(size_t i) <span class="kw">const</span>;
     std::size_t      <span class="fn">num_segments</span>()    <span class="kw">const</span>;
+    std::optional&lt;std::size_t&gt; <span class="fn">sort_key_col</span>() <span class="kw">const</span>;
 };</code></pre>
 
   <p>Segments are logically ordered by insertion order. There is no global index — the scan
   operator iterates <code>segment(0) .. segment(n-1)</code> and relies on zone maps to skip
-  irrelevant ones.</p>
+  irrelevant ones. Within a surviving segment, a table with a sort key also has the
+  per-segment sparse primary index, which lets the scan start past rows that cannot match
+  (see <a href="#scan">Scan Operator</a>). The benchmark readings table is sorted on
+  <code>ts</code> (column 1).</p>
 </section>
 
 <section id="csv">
   <h2>CSV Loader</h2>
-  <p><code>load_csv(table, path, rows_per_segment)</code> streams the file row by row, parsing
-  each field and appending to a <code>SegmentBuilder</code>. Every <code>rows_per_segment</code>
-  rows it calls <code>seal()</code> and starts a fresh builder.</p>
+  <p><code>load_csv(table, path, rows_per_segment = 65536)</code> streams the file line by line,
+  parsing each field and appending to a <code>SegmentBuilder</code>. Every
+  <code>rows_per_segment</code> rows it calls
+  <code>seal(table.sort_key_col(), 8192)</code> and starts a fresh builder.</p>
 
   <p><strong>Key properties:</strong></p>
   <ul style="margin:0 0 14px 20px;line-height:2">
-    <li>O(1) memory — only one segment worth of data in RAM at a time during load</li>
+    <li>Bounded staging — only one segment's raw buffers are held in the builder at a time</li>
     <li>Header validation — CSV column names must match schema column names in order</li>
     <li>Partial final segment — last segment sealed even if &lt; rows_per_segment rows</li>
     <li>Type dispatch via <code>switch(DataType)</code> per field</li>
+    <li>No quote handling — fields are split on every comma</li>
   </ul>
 
-  <div class="callout warn">
+  <h4>No allocation per row</h4>
+  <p><code>split_csv_line</code> splits a line into a <code>std::vector&lt;std::string_view&gt;</code>
+  that is cleared and reused for every row, so after the first row splitting allocates nothing.
+  Int64 fields are parsed with <code>std::from_chars</code>; Float64 fields with
+  <code>std::strtod</code> (not every libc++ the project builds against has the floating-point
+  <code>from_chars</code> overload). Both reject trailing garbage. String fields are still copied
+  into a <code>std::string</code>.</p>
+
+  <div class="callout success">
     <strong>Performance note</strong>
-    Loading 10M rows takes ~3 seconds. The bottleneck is <code>std::stoll</code> /
-    <code>std::stod</code> string parsing plus <code>std::getline</code> line scanning —
-    not segment building or zone-map updates. A custom SIMD integer parser
-    (e.g. parse 8 digits in parallel) would cut this by 5–10×.
+    <code>bench/results/baseline.txt</code> vs <code>after-footprint.txt</code> (10M readings):
+    load time 2,163 ms → <strong>1,130 ms</strong>, allocations 30,010,877 (3.00/row) →
+    <strong>11,339</strong> (0.00/row).
   </div>
 </section>
 
@@ -598,16 +758,23 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
 
 <section id="batch">
   <h2>Batch</h2>
-  <p>A <code>Batch</code> is a <strong>non-owning view</strong> over a window of rows within a
-  segment. It holds borrowed pointers to column vectors, an offset into those arrays, and an
-  optional selection vector identifying which rows are live.</p>
+  <p>A <code>Batch</code> is a <strong>non-owning view</strong> over a window of rows. Both its
+  column list and its selection vector are <code>std::span</code>s borrowed from buffers owned by
+  the operator that produced it, so building a batch allocates nothing.</p>
 
 <pre><code><span class="kw">class</span> <span class="ty">Batch</span> {
-    std::vector&lt;<span class="kw">const</span> <span class="ty">Vector</span>*&gt;                vectors_;  <span class="cm">// borrowed, not owned</span>
-    std::optional&lt;std::vector&lt;uint32_t&gt;&gt;      sel_;      <span class="cm">// absent = all rows live</span>
-    <span class="ty">uint32_t</span>                                  offset_;   <span class="cm">// first row in column arrays</span>
-    <span class="ty">uint32_t</span>                                  size_;     <span class="cm">// row count in this batch</span>
+    std::span&lt;<span class="kw">const</span> <span class="ty">Vector</span>* <span class="kw">const</span>&gt; columns_;  <span class="cm">// borrowed from the producer</span>
+    std::span&lt;<span class="kw">const</span> <span class="ty">uint32_t</span>&gt;       sel_;      <span class="cm">// borrowed; meaningful only if has_sel_</span>
+    <span class="ty">uint32_t</span>                        offset_;   <span class="cm">// first row in column arrays</span>
+    <span class="ty">uint32_t</span>                        size_;     <span class="cm">// live row count in this batch</span>
+    <span class="ty">bool</span>                            has_sel_;  <span class="cm">// false = rows [offset, offset+size) all live</span>
+<span class="kw">public</span>:
+    <span class="kw">void</span> <span class="fn">set_sel</span>(std::span&lt;<span class="kw">const</span> <span class="ty">uint32_t</span>&gt; sel);  <span class="cm">// borrows; sets size_ = sel.size()</span>
 };</code></pre>
+
+  <p>A segment's columns come from <code>ScanOperator::batch_cols_</code>; an aggregate's or
+  join's output columns from that operator's own vectors; the selection vector from
+  <code>FilterOperator::survivors_buf_</code>.</p>
 
   <div class="diagram" style="font-size:12px">
   Segment column (65,536 elements):
@@ -623,16 +790,21 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
   </div>
 
   <p><strong>Lifetime contract:</strong> a batch is valid only until the next call to
-  <code>next()</code> on any operator in the pipeline. Callers must not hold a batch across a
-  subsequent <code>next()</code> call. This allows column pointers to stay borrowed without
-  copying data.</p>
+  <code>next()</code> on the operator that produced it (or any operator upstream of it), and only
+  while the underlying segment is alive. Callers must not hold a batch across a subsequent
+  <code>next()</code> call. That is what lets the producer reuse its column-pointer and
+  selection buffers. Anything that must outlive the batch (a join's build side, an exchange
+  payload) is copied into an owned <code>Chunk</code>.</p>
 
   <h4>Selection vector semantics</h4>
-  <p>When <code>sel()</code> is absent, the live rows are the contiguous range
-  <code>[offset, offset + size)</code>. When present, <code>sel()[j]</code> is an absolute
+  <p>When <code>has_sel()</code> is false, the live rows are the contiguous range
+  <code>[offset, offset + size)</code>. When true, <code>sel()[j]</code> is an absolute
   index into the column arrays — each entry is a row that survived all filters applied so far.
   Stacking filters is just intersection: the second filter iterates <code>sel</code> rather than
   the full range.</p>
+
+  <p><code>for_each_live_row(batch, f)</code> hides that split: it calls <code>f(row)</code> for
+  every live row, with <code>row</code> an absolute index, whichever form the batch has.</p>
 </section>
 
 <section id="operator">
@@ -641,8 +813,14 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
 
 <pre><code><span class="kw">class</span> <span class="ty">Operator</span> {
 <span class="kw">public</span>:
-    <span class="kw">virtual</span> std::optional&lt;<span class="ty">Batch</span>&gt; <span class="fn">next</span>() = <span class="nm">0</span>;
+    <span class="kw">virtual</span> ~<span class="ty">Operator</span>() = <span class="kw">default</span>;
+    <span class="kw">virtual</span> std::optional&lt;<span class="ty">Batch</span>&gt; <span class="fn">next</span>() = <span class="nm">0</span>;  <span class="cm">// nullopt = exhausted</span>
 };</code></pre>
+
+  <p>Operators today: <code>ScanOperator</code>, <code>FilterOperator</code>,
+  <code>HashAggOperator</code> and <code>HashJoinOperator</code>. The aggregate and the join's
+  build side are pipeline breakers: they drain a child completely on their first
+  <code>next()</code>.</p>
 
   <p>This is the <strong>Volcano / iterator model</strong>, but lifted from row-at-a-time to
   batch-at-a-time. Each call to <code>next()</code> returns one <code>Batch</code> or
@@ -655,8 +833,8 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
   while (auto batch = filter.<span class="fn">next</span>()) {           <span class="cm">// pulls from filter</span>
       <span class="cm">// filter.next() internally calls scan.next()  ← pulls from scan</span>
       <span class="cm">// scan.next() reads from the Table            ← reads from storage</span>
-      for (uint32_t i : *batch-&gt;sel())
-          sum += vals[i];
+      const auto&amp; vals = static_cast&lt;const Float64Vector&amp;&gt;(batch-&gt;column(1));
+      for_each_live_row(*batch, [&amp;](uint32_t i) { sum += vals.value(i); });
   }
   </div>
 </section>
@@ -684,6 +862,9 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
             ++segments_pruned_;  ++seg_idx_;  <span class="kw">continue</span>;  <span class="cm">// skip entire segment</span>
         }
         ++segments_scanned_;
+        <span class="kw">if</span> (predicate_ is on table.sort_key_col())        <span class="cm">// sparse primary index</span>
+            row_idx_ = <span class="fn">scan_start_row</span>(seg.primary_index(), *predicate_);
+        batch_cols_ = projected column pointers;        <span class="cm">// rebuilt once per segment</span>
         seg_initialized_ = <span class="nm">true</span>;
     }
 
@@ -691,9 +872,17 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
     <span class="kw">if</span> (remaining == <span class="nm">0</span>) { advance_to_next_segment(); <span class="kw">continue</span>; }
 
     batch_size = min(remaining, target_batch_size_);
-    <span class="cm">// Borrow projected column pointers</span>
-    <span class="kw">return</span> <span class="ty">Batch</span>{vecs, offset, batch_size};   <span class="cm">// O(ncols) work</span>
+    <span class="kw">return</span> <span class="ty">Batch</span>{batch_cols_, offset, batch_size};   <span class="cm">// O(1): borrows batch_cols_</span>
 }</code></pre>
+
+  <h4>Sparse primary index: scan_start_row</h4>
+  <p>When the predicate is on the table's sort key, <code>scan_start_row(idx, pred)</code>
+  binary-searches the segment's <code>IndexEntry</code> list for the last granule whose first key
+  is ≤ the literal and starts the scan there. It skips rows only for <code>&gt;</code>,
+  <code>&gt;=</code> and <code>==</code>; for <code>&lt;</code>, <code>&lt;=</code> and
+  <code>!=</code> it returns 0. It is a public free function in <code>exec/scan.h</code> because
+  the compiled engine's host calls the same function, so both engines read identical row
+  ranges. The scan does not stop early at the upper end; the filter removes the rest.</p>
 
   <div class="callout">
     <strong>Projection</strong>
@@ -717,35 +906,48 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
 
         <span class="kw">const</span> <span class="ty">Vector</span>&amp; col = batch-&gt;<span class="fn">column</span>(predicate_.col_idx);
 
-        <span class="cm">// ONE type dispatch + ONE op dispatch per batch:</span>
+        <span class="cm">// ONE type × encoding × op dispatch per batch:</span>
+        std::size_t n = <span class="nm">0</span>;
         <span class="kw">switch</span> (col.<span class="fn">type</span>()) {
             <span class="kw">case</span> <span class="ty">DataType</span>::<span class="nm">Int64</span>: {
-                <span class="kw">auto</span> data = <span class="kw">static_cast</span>&lt;<span class="kw">const</span> <span class="ty">Int64Vector</span>&amp;&gt;(col).<span class="fn">data</span>();
                 <span class="ty">int64_t</span> lit = std::get&lt;<span class="ty">int64_t</span>&gt;(predicate_.value);
-                <span class="fn">dispatch_op</span>(data, *batch, predicate_.op, lit, survivors_buf_);
+                <span class="kw">static_cast</span>&lt;<span class="kw">const</span> <span class="ty">Int64Vector</span>&amp;&gt;(col).<span class="fn">visit</span>([&amp;](<span class="kw">auto</span> codes, <span class="ty">int64_t</span> base) {
+                    <span class="kw">auto</span> get = [&amp;](<span class="ty">uint32_t</span> i) { <span class="kw">return</span> <span class="ty">Int64Vector</span>::<span class="fn">decode</span>(base, codes[i]); };
+                    n = <span class="fn">dispatch_op</span>(*batch, get, predicate_.op, lit, survivors_buf_);
+                });
+                <span class="kw">break</span>;
             }
-            <span class="cm">// ...Float64, String mirrored</span>
+            <span class="cm">// ...Float64 (visit: double or float storage), String mirrored</span>
         }
 
-        <span class="kw">if</span> (survivors_buf_.<span class="fn">empty</span>()) <span class="kw">continue</span>;  <span class="cm">// whole batch filtered out</span>
-        batch-&gt;<span class="fn">set_sel</span>(survivors_buf_);
+        <span class="kw">if</span> (n == <span class="nm">0</span>) <span class="kw">continue</span>;  <span class="cm">// whole batch filtered out</span>
+        batch-&gt;<span class="fn">set_sel</span>({survivors_buf_.<span class="fn">data</span>(), n});  <span class="cm">// borrowed, not copied</span>
         <span class="kw">return</span> batch;
     }
 }</code></pre>
 
-  <h4>Template kernel — the inner loop</h4>
-<pre><code><span class="kw">template</span> &lt;<span class="kw">typename</span> T, <span class="kw">typename</span> Compare&gt;
-<span class="kw">void</span> <span class="fn">filter_kernel_range</span>(span&lt;const T&gt; data, uint32_t start, uint32_t end,
-                          const T&amp; lit, Compare cmp, vector&lt;uint32_t&gt;&amp; out) {
-    out.<span class="fn">clear</span>();
-    out.<span class="fn">reserve</span>(end - start);
-    <span class="kw">for</span> (uint32_t i = start; i &lt; end; ++i)
-        <span class="kw">if</span> (<span class="fn">cmp</span>(data[i], lit)) out.<span class="fn">push_back</span>(i);
+  <h4>Branchless kernel — the inner loop</h4>
+<pre><code><span class="kw">template</span> &lt;<span class="kw">typename</span> Pred&gt;
+std::size_t <span class="fn">select_rows</span>(<span class="kw">const</span> <span class="ty">Batch</span>&amp; batch, Pred pred, std::vector&lt;<span class="ty">uint32_t</span>&gt;&amp; out) {
+    <span class="kw">if</span> (out.<span class="fn">size</span>() &lt; batch.<span class="fn">size</span>()) out.<span class="fn">resize</span>(batch.<span class="fn">size</span>());  <span class="cm">// grows once, then reused</span>
+    <span class="ty">uint32_t</span>* dst = out.<span class="fn">data</span>();
+    std::size_t n = <span class="nm">0</span>;
+    <span class="kw">for</span> (<span class="ty">uint32_t</span> i = batch.<span class="fn">offset</span>(); i &lt; end; ++i) {  <span class="cm">// or: for (i : batch.sel())</span>
+        dst[n] = i;        <span class="cm">// always store the index...</span>
+        n += <span class="fn">pred</span>(i);     <span class="cm">// ...advance the cursor only if it passed</span>
+    }
+    <span class="kw">return</span> n;
 }</code></pre>
-  <p>When instantiated as <code>filter_kernel_range&lt;int64_t, std::greater&lt;&gt;&gt;</code>,
-  the compiler sees one comparison per iteration with both operand types and the operator known
-  at compile time. At <code>-O3 -march=native</code> this loop is eligible for NEON/AVX2
-  autovectorisation.</p>
+  <p><code>dispatch_op</code> switches on the <code>CompareOp</code> and calls
+  <code>select_rows</code> with <code>std::greater&lt;&gt;</code> (etc.) baked in, so each
+  instantiation sees one width, one comparison and one literal type at compile time. Every row
+  index is written; only the cursor depends on the predicate, so there is no data-dependent
+  branch and mid-selectivity filters do not pay for mispredictions. Downstream operators then
+  touch only the survivors. In the codegen experiment this is where the vectorized engine won:
+  Q2 <code>value &gt; 50</code> 6.8 vs 13.7 ms, and Q3 (two predicates) 7.2 vs 35.3 ms, against
+  generated code at -O3. Q3's generated loop kept a real, unpredictable branch; in Q2 clang
+  if-converted the branch, so all 10M rows ran a dependent add
+  (<code>docs/superpowers/specs/2026-10-21-codegen-vs-vectorized-design.md</code> §11).</p>
 </section>
 
 <section id="predicate">
@@ -764,6 +966,290 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
     <tr><td><code>ScanOperator</code> (zone-map pruning)</td><td>original column index in the Table/Segment</td></tr>
     <tr><td><code>FilterOperator</code> (row selection)</td><td>batch column position (after projection remapping)</td></tr>
   </table>
+
+  <p>A <code>Predicate</code> covers one column. Conjunctions live in the plan:
+  <code>plan::Filter</code> holds a list of <code>Compare</code>s, which
+  <code>run_vectorized</code> lowers to one chained <code>FilterOperator</code> per conjunct, and
+  translates the first conjunct to table numbering for the scan's pruning.</p>
+</section>
+
+<section id="hashagg">
+  <h2>Hash Aggregation</h2>
+  <p><code>HashAggOperator</code> computes <code>[GROUP BY group_col]</code> with a list of
+  aggregates. The group key must be Int64.</p>
+
+<pre><code><span class="kw">enum class</span> <span class="ty">AggKind</span> : std::uint8_t { Count, Sum, Min, Max, Avg, Median };
+
+<span class="kw">struct</span> <span class="ty">AggSpec</span> {
+    <span class="ty">AggKind</span>     kind;
+    std::size_t col  = <span class="nm">0</span>;                <span class="cm">// ignored for COUNT(*)</span>
+    <span class="ty">DataType</span>    type = <span class="ty">DataType</span>::<span class="nm">Int64</span>;
+};
+
+<span class="ty">HashAggOperator</span>(std::unique_ptr&lt;<span class="ty">Operator</span>&gt; child,
+                std::optional&lt;std::size_t&gt; group_col,   <span class="cm">// nullopt = global aggregate</span>
+                std::vector&lt;<span class="ty">AggSpec</span>&gt; aggs);</code></pre>
+
+  <p>Output columns: the group key (Int64, if grouped), then one per aggregate. COUNT is Int64;
+  SUM, MIN and MAX keep the input's type; AVG and MEDIAN are Float64. One row per group, in
+  first-seen order. The first <code>next()</code> drains the child, builds the output columns
+  and then emits them in batches of 4,096.</p>
+
+  <h4>Group state inline in hash slots: GroupSlots</h4>
+  <p>Each group's aggregate state is a fixed-size block stored <em>inside</em> its hash slot:</p>
+  <div class="mem-row">
+    <div class="mem-label">slot</div>
+    <div class="mem-cell int64">key int64</div>
+    <div class="mem-cell zone">gid uint32 + pad</div>
+    <div class="mem-cell f64">state: __int128 sums · count · 8-byte fields · MedianHandles</div>
+  </div>
+  <p>Slots are 16-byte aligned. Open addressing with linear probing, a multiplicative hash
+  (<code>key × 0x9E3779B97F4A7C15</code>, low bits), power-of-two capacity and load factor
+  ≤ 0.5. Group ids are dense and first-seen (0, 1, 2, …) and give the output order.
+  <code>INT64_MIN</code> is the empty-slot marker, so that one key's state lives outside the
+  slot array.</p>
+
+  <h4>Two passes per batch</h4>
+  <ol style="margin:0 0 14px 20px;line-height:2">
+    <li><strong>Pass 1</strong> — <code>reserve(size() + rows)</code>, so the table cannot rehash
+    during the batch; then for each live row, <code>find_or_insert</code> its key, initialise a
+    fresh group, increment its count and store the row's state pointer in
+    <code>ptrs_</code>.</li>
+    <li><strong>Pass 2</strong> — one loop per aggregate over <code>ptrs_</code>, updating state
+    in place. The column's encoding is resolved once per loop via <code>visit()</code>.</li>
+  </ol>
+  <p>A global aggregate has a single state block. Each aggregate accumulates in a local variable
+  for the batch (a register, not a memory read-modify-write per row), in row order.</p>
+
+  <h4>Semantics (shared with the compiled engine)</h4>
+  <table>
+    <tr><th>Aggregate</th><th>Rule</th></tr>
+    <tr><td>COUNT(*)</td><td>Int64 count of live rows per group</td></tr>
+    <tr><td>SUM</td><td>Starts at <code>0</code> / <code>+0.0</code> and every row adds. SUM(Int64)
+    accumulates in <code>__int128</code> and throws <code>std::overflow_error</code> at output if the
+    result does not fit in int64.</td></tr>
+    <tr><td>AVG</td><td>Same accumulator as SUM, divided by the count as double</td></tr>
+    <tr><td>MIN / MAX</td><td>Start at the group's first value, update with
+    <code>v &lt; m || v != v</code> (resp. <code>&gt;</code>): a NaN wins and stays</td></tr>
+    <tr><td>MEDIAN</td><td>Exact. Values collected per group in the column's storage type, selected
+    under <code>median_less</code>: numbers ascending with <code>-0.0</code> before
+    <code>+0.0</code>, then NaNs ordered by bit pattern. Even counts average the two middle values.</td></tr>
+  </table>
+
+  <div class="callout">
+    <strong>Global aggregate over no rows</strong>
+    <code>HashAggOperator</code> emits no row in that case. SQL wants one row, so
+    <code>run_vectorized</code> (<code>src/plan/lower_vec.cpp</code>) appends it with
+    <code>QueryResult::append_empty_aggregate_row</code>: COUNT columns 0, every other column NULL.
+    The compiled engine's host does the same.
+  </div>
+
+  <p>The older <code>AggHashTable</code> (key → {sum, count}) remains for
+  <code>parallel_group_sum_count</code>, the multi-threaded GROUP BY SUM/COUNT path in which
+  workers claim one segment at a time through an atomic counter.</p>
+</section>
+
+<section id="median">
+  <h2>MEDIAN Storage</h2>
+  <p>Exact MEDIAN must keep every value. <code>MedianStore&lt;T&gt;</code> (T = <code>int64_t</code>,
+  <code>double</code>, or <code>float</code> for narrow columns) keeps them in per-group
+  <strong>chains of 2 KiB blocks</strong>, carved from <strong>128 KiB chunks</strong> of 64
+  blocks that never move. There is no doubling and no copy on growth. A group's inline state
+  holds only a <code>MedianHandle{head, tail, count}</code>.</p>
+
+  <div class="diagram" style="font-size:12px">
+  chunks_[0] (128 KiB)  [blk0][blk1][blk2] ... [blk63]     chunks_[1] ...
+  next_[b], size_[b]    per-block headers kept out of band, so a block is exactly 2 KiB
+                        (256 int64/double or 512 float — a power of two)
+
+  group 7: head ─► blk2 ─► blk9 ─► blk40 ◄─ tail      count = 700
+  </div>
+
+  <h4>Finalize</h4>
+  <ul style="margin:0 0 14px 20px;line-height:2">
+    <li><strong>Grouped:</strong> each chain is copied into one scratch vector reused across
+    groups and selected with <code>std::nth_element</code> under <code>median_less</code>.</li>
+    <li><strong>Global:</strong> the only chain's blocks are consecutive and all full but the
+    last, so value <code>i</code> is at block <code>head + i / 256</code> (or 512), slot
+    <code>i % 256</code>. The median is selected <em>in place</em> by an introselect through that
+    accessor: three-way quickselect with a median-of-3 pivot, falling back to heapsort after
+    about 2·log₂ n rounds, so the worst case is O(n log n). No second copy of the values is
+    made.</li>
+  </ul>
+
+  <div class="callout success">
+    <strong>Effect</strong>
+    Q7 (median by device, 10M rows) peak memory went from 382.9 MiB to
+    <strong>89.0 MiB</strong> on the vectorized engine; Q8 (global median) from 381.3 to
+    <strong>75.9 MiB</strong>; Q7 on a <code>narrow_float</code> column 51.2 MiB
+    (<code>docs/superpowers/specs/2026-10-21-footprint-fixes-design.md</code> §7).
+  </div>
+</section>
+
+<section id="hashjoin">
+  <h2>Hash Join</h2>
+  <p><code>HashJoinOperator(probe, build, probe_key_col, build_key_col)</code> is an inner
+  equi-join on one Int64 key. Output columns are every probe column, then every build column.
+  Duplicate keys on either side give the full cross product per key, and probe batches may carry
+  a selection vector.</p>
+
+  <h4>Build side</h4>
+  <ol style="margin:0 0 14px 20px;line-height:2">
+    <li>On the first <code>next()</code>, drain the build child and copy every live row into one
+    owned <code>Chunk</code> (batches die at the next <code>next()</code>).</li>
+    <li>Stable-sort the rows by key into a second chunk, so all rows of a key are contiguous.</li>
+    <li>Index each run of equal keys as a <code>Bucket{key, first, count}</code> (16 B per distinct
+    key): open addressing, linear probing, load factor ≤ 0.5, indexed by the <em>top</em> bits of
+    the multiplicative hash.</li>
+  </ol>
+
+  <h4>Probe side</h4>
+  <p>Each probe batch's live rows and decoded keys are collected once; matches are gathered into
+  output batches of at most 4,096 rows. An output batch never spans two probe batches, because
+  pulling the next probe batch invalidates the current one.</p>
+  <p>For Int64/Float64 joins the output columns are owned by the operator and
+  <strong>refilled in place</strong> by every <code>next()</code>, using
+  <code>reset_plain</code> / <code>reset</code>, so there is no per-batch allocation. A join
+  with any String column falls back to sealing fresh chunks per output batch.</p>
+
+  <div class="callout success">
+    <strong>Effect</strong>
+    Reusing output columns cut Q5 (join + group by region) on the vectorized engine from
+    21.8 to <strong>11.5 ms</strong>, and allocations per run from about 31,000 to 301
+    (<code>docs/superpowers/specs/2026-10-21-footprint-fixes-design.md</code> §7).
+  </div>
+</section>
+
+<hr>
+
+<!-- ═══════ QUERY LAYER ═══════ -->
+
+<section id="plan">
+  <h2>Plan IR</h2>
+  <p><code>src/plan/plan.h</code> defines a small logical plan shared by both engines. Column
+  references are positions in the child's output, as with the operators.</p>
+
+<pre><code><span class="kw">struct</span> <span class="ty">Scan</span>      { <span class="kw">const</span> <span class="ty">Table</span>* table; std::vector&lt;size_t&gt; cols; };
+<span class="kw">struct</span> <span class="ty">Filter</span>    { NodePtr child; std::vector&lt;<span class="ty">Compare</span>&gt; conjuncts; };   <span class="cm">// AND</span>
+<span class="kw">struct</span> <span class="ty">HashJoin</span>  { NodePtr probe, build; size_t probe_key, build_key; };
+<span class="kw">struct</span> <span class="ty">Aggregate</span> { NodePtr child; std::optional&lt;size_t&gt; group_col; std::vector&lt;<span class="ty">AggExpr</span>&gt; aggs; };
+
+<span class="kw">struct</span> <span class="ty">Node</span> { std::variant&lt;<span class="ty">Scan</span>, <span class="ty">Filter</span>, <span class="ty">HashJoin</span>, <span class="ty">Aggregate</span>&gt; op; };</code></pre>
+
+  <p><code>validate_query</code> checks the plan: Int64/Float64 columns only, column references in
+  range, literal types matching their columns, Int64 join and group keys, and exactly one
+  Aggregate, at the root. Every query is therefore an aggregate, and its answer is a
+  <code>QueryResult</code>: typed columns with a validity byte per row, sorted by group key by
+  <code>canonicalize()</code> so emission order does not matter.</p>
+
+  <table>
+    <tr><th>Entry point</th><th>Engine</th></tr>
+    <tr><td><code>plan::run_vectorized(root)</code></td><td>Lowers to Scan / Filter / HashJoin operators under a <code>HashAggOperator</code></td></tr>
+    <tr><td><code>codegen::run_compiled(root, options, stats)</code></td><td>Generates, compiles, loads and runs C++ for the plan</td></tr>
+  </table>
+</section>
+
+<section id="codegen">
+  <h2>Compiled Engine</h2>
+  <p>The compiled engine is a HyPer-style data-centric code generator. Instead of passing batches
+  between operators, it fuses each pipeline into one tight loop over a segment's rows.</p>
+
+  <div class="diagram" style="font-size:12px">
+  plan ──bind_scans()──► <span class="box">ScanBinding</span>s  (projected Int64 cols, width signatures, prune predicate)
+    │
+    ▼  generate()  produce/consume
+  C++ source  ── FNV-1a cache key (source + compiler + flags + runtime.h) ──┐
+    │                                                                    │
+    ▼  in-memory cache ─► on-disk cache (.wb_cache/&lt;key&gt;.dylib) ─► $WB_CXX (clang++)
+  <span class="box2">dlopen</span>(RTLD_NOW) ─► dlsym wb_query + ABI check
+    │
+    ▼  execute(): prune segments exactly like ScanOperator, bind columns into QueryInput
+  wb_query(input, output) ─► emit_row() ─► <span class="box3">QueryResult</span>
+  </div>
+
+  <h4>Produce / consume</h4>
+  <p><code>generate()</code> walks the plan: <code>produce(node, consume)</code> on a Scan opens a
+  per-segment row loop and calls the parent's <code>consume</code> with lazily loaded columns
+  (a column is decoded at first use, HyPer's "load attributes when first touched"). A Filter's
+  consume emits an <code>if</code>; a HashJoin produces its build side first, filling a join
+  table, then its probe side, looping over each probe tuple's matches; the Aggregate's consume
+  updates a group record. Scans are numbered in pre-order, build side before probe side, which is
+  also the order pipelines run.</p>
+
+  <h4>Specialised per FOR width signature</h4>
+  <p>A segment's <em>width signature</em> packs the code width of the scan's k-th Int64 column
+  into bits 2k..2k+1. <code>bind_scans</code> collects the distinct signatures across the table's
+  segments; the generator emits one instantiation of the pipeline per signature and a
+  <code>switch (seg.width_sig)</code> that dispatches each segment. A library asked to run a
+  signature it was not compiled for reports an error.</p>
+
+  <h4>runtime.h (ABI 4)</h4>
+  <p><code>src/codegen/runtime.h</code> is compiled into every generated library and included by
+  the host, so both share one definition of the ABI structs (<code>ColumnRef</code>,
+  <code>SegmentRef</code>, <code>QueryInput</code>, <code>QueryOutput</code>). It includes only
+  <code>&lt;cstdint&gt;</code>/<code>&lt;cstddef&gt;</code>, no STL, and allocates with
+  <code>__builtin_malloc</code>, so generated code compiles quickly and never depends on engine
+  struct layouts. <code>kAbiVersion = 4</code>; the host rejects a library built against another
+  version. Its data structures mirror the vectorized engine's algorithms, so benchmarks compare
+  execution models rather than hash tables:</p>
+  <table>
+    <tr><th>runtime.h</th><th>Mirrors</th></tr>
+    <tr><td><code>GroupRows&lt;Row&gt;</code></td><td><code>GroupSlots</code>: same hash, probing, initial capacity and growth; <code>Row</code> defined by the generated code, stored inline</td></tr>
+    <tr><td><code>MedianStore&lt;T&gt;</code></td><td><code>exec/median_store.h</code>: 2 KiB blocks, 64-block chunks, same introselect</td></tr>
+    <tr><td><code>JoinTable</code></td><td><code>HashJoinOperator</code>: rows sorted by key, (key, first, count) buckets</td></tr>
+  </table>
+
+  <h4>Compile and cache</h4>
+  <p>Flags: <code>-std=c++20 -O&lt;n&gt; -march=native -fPIC -shared</code> plus
+  <code>$WB_CODEGEN_EXTRA_FLAGS</code>. The cache key is FNV-1a 64 over the source, compiler path,
+  flags and the contents of <code>runtime.h</code>. Libraries stay loaded for the life of the
+  process. Every failure throws <code>CodegenError</code>; the engine never silently falls back
+  to the vectorized path.</p>
+
+  <div class="callout warn">
+    <strong>One-off cost</strong>
+    Per cold query: generate under 0.1 ms, compile 45–93 ms, load 155–230 ms. The first
+    <code>dlopen</code> of a newly written <code>.dylib</code> costs more than compiling it;
+    reopening a cached file in a later process takes 0.25–0.87 ms
+    (<code>docs/superpowers/specs/2026-10-21-codegen-vs-vectorized-design.md</code> §11).
+  </div>
+</section>
+
+<section id="parity">
+  <h2>Engine Parity</h2>
+  <p>Both engines must return <strong>bit-identical</strong> results:
+  <code>QueryResult::operator==</code> compares doubles by bit pattern and treats NULL as equal to
+  NULL. That requirement shapes the implementation:</p>
+  <ul style="margin:0 0 14px 20px;line-height:2">
+    <li>Pruning is identical: the host calls the same <code>zone_map_can_match</code> and
+    <code>scan_start_row</code> on the same first conjunct.</li>
+    <li>Float sums are added in the same row order in both engines (the compiled global aggregate
+    continues from the previous segment's accumulator), so no reassociation and no SIMD
+    reductions.</li>
+    <li>MIN/MAX NaN rules, <code>__int128</code> SUM overflow and <code>median_less</code> are
+    specified once and implemented in both.</li>
+    <li>A global aggregate over no rows gets the same COUNT-0 / NULL row from both hosts.</li>
+  </ul>
+  <p><code>wb_codegen</code> checks every query on the vectorized engine and on generated code at
+  -O1 and -O3; <code>tests/test_codegen.cpp</code> covers the same ground in the test suite.</p>
+</section>
+
+<section id="dist">
+  <h2>Distributed Layer</h2>
+  <p><code>src/dist/</code> simulates a Redshift cluster in one process: nodes × slices, each
+  slice holding its own part of every table and run on its own thread.</p>
+  <ul style="margin:0 0 14px 20px;line-height:2">
+    <li><strong>DISTSTYLE</strong> — EVEN (round-robin), KEY (<code>slice_for_key</code>, the high
+    32 bits of the multiplicative hash), ALL (one copy per node).</li>
+    <li><strong>Exchange</strong> — redistribute on a key or broadcast, moving owned
+    <code>Chunk</code>s; <code>NetworkStats</code> counts bytes moved between slices.</li>
+    <li><strong>Streams</strong> — <code>run_stream</code> runs one thread per slice; each exchange
+    boundary is a barrier.</li>
+    <li><strong>Join planner</strong> — the DS_* strategies (DS_DIST_NONE, DS_DIST_ALL_NONE,
+    DS_DIST_INNER, DS_DIST_OUTER, DS_BCAST_INNER, DS_DIST_BOTH); among valid ones it picks the
+    one that sends the fewest rows across nodes.</li>
+  </ul>
+  <p><code>wb_dist</code> runs the strategy, skew and crossover experiments.</p>
 </section>
 
 <hr>
@@ -811,10 +1297,11 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
       <h4 style="color:var(--green)">Vectorized — per batch</h4>
       <p style="font-size:13px;margin:0">
         <code>switch(col.type())</code> once<br>
-        <code>dispatch_op&lt;T&gt;</code> → <code>switch(op)</code> once<br>
+        <code>visit()</code> → code width (or float/double) once<br>
+        <code>dispatch_op</code> → <code>switch(op)</code> once<br>
         <code>run(std::greater&lt;&gt;{})</code> baked in at compile time<br>
-        Inner loop: <code>cmp(data[i], lit)</code> only<br>
-        <em>Compiler can autovectorise the loop</em>
+        Inner loop: <code>dst[n] = i; n += cmp(decode(base, codes[i]), lit)</code><br>
+        <em>No data-dependent branch in the loop</em>
       </p>
     </div>
   </div>
@@ -822,7 +1309,9 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
   <p>The <code>auto run = [&amp;](auto cmp)</code> generic lambda is the mechanism. Each call
   site (<code>run(std::greater&lt;&gt;{})</code>, <code>run(std::less&lt;&gt;{})</code>, etc.)
   generates a distinct specialisation with a different <code>Compare</code> type, so no runtime
-  polymorphism reaches the inner loop body.</p>
+  polymorphism reaches the inner loop body. The same "resolve encoding once, then loop" pattern
+  is used by <code>HashAggOperator</code> (<code>for_each_int</code> / <code>for_each_double</code>)
+  and by the join's key decode and output gather.</p>
 </section>
 
 <section id="projection">
@@ -842,15 +1331,27 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
 
 <section id="buffers">
   <h2>Buffer Reuse</h2>
-  <p><code>FilterOperator</code> owns a persistent <code>std::vector&lt;uint32_t&gt; survivors_buf_</code>.
-  The kernel fills it in-place via an <code>out&amp;</code> parameter —
-  <code>out.clear()</code> resets size but preserves allocation. After warmup (a few batches),
-  the buffer's capacity stabilises at the high-water mark of survivors per batch and no further
-  heap allocations occur for the building phase.</p>
+  <p>The steady-state query path allocates nothing per batch. Every buffer a batch points at is
+  owned by an operator and reused:</p>
+  <table>
+    <tr><th>Buffer</th><th>Owner</th><th>Reuse</th></tr>
+    <tr><td><code>survivors_buf_</code></td><td><code>FilterOperator</code></td><td>Grown to the batch size once (<code>resize</code>, never shrunk); the emitted batch's selection span borrows it — no copy</td></tr>
+    <tr><td><code>batch_cols_</code></td><td><code>ScanOperator</code></td><td>Column pointers rebuilt once per segment; every batch's column span borrows it</td></tr>
+    <tr><td><code>ptrs_</code></td><td><code>HashAggOperator</code></td><td>Per-batch state pointers, resized in place</td></tr>
+    <tr><td><code>out_vecs_</code></td><td><code>HashJoinOperator</code></td><td>Int64/Float64 output columns refilled with <code>reset_plain</code> / <code>reset</code>, keeping capacity</td></tr>
+    <tr><td><code>fields</code></td><td><code>load_csv</code></td><td>One <code>vector&lt;string_view&gt;</code> for every row's split</td></tr>
+  </table>
 
-  <p><code>set_sel(survivors_buf_)</code> copies the survivors into the Batch (the Batch owns its
-  sel vector independently). The copy costs <code>~survivors × 4 bytes</code> per batch but
-  allows <code>survivors_buf_</code> to retain capacity.</p>
+  <p>Because batches are spans into these buffers, the price is the lifetime contract: a batch
+  dies at the producer's next <code>next()</code>.</p>
+
+  <div class="callout success">
+    <strong>Effect</strong>
+    <code>ts &gt; mid sum(value)</code> on 10M rows: 2,472 allocations and 12.9 ms per query in
+    <code>bench/results/baseline.txt</code>, 7 allocations and <strong>4.9 ms</strong> in
+    <code>after-footprint.txt</code>. These runs also include the column encoding changes, so the
+    gain is not from buffer reuse alone.
+  </div>
 </section>
 
 <hr>
@@ -869,10 +1370,22 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
       <td>Simplifies ownership (unique_ptr, no locks), enables safe concurrent reads, matches real columnar engines (Parquet, ClickHouse)</td>
     </tr>
     <tr>
-      <td>Column storage</td>
-      <td><span class="badge badge-blue">std::vector&lt;T&gt;</span></td>
-      <td>Flat byte buffer + manual offsets</td>
-      <td>std::vector gives correct resizing semantics during build; <code>span</code> gives zero-copy access after seal</td>
+      <td>Int64 column storage</td>
+      <td><span class="badge badge-blue">Frame-of-reference, 1/2/4/8-byte codes</span></td>
+      <td>Plain <code>std::vector&lt;int64_t&gt;</code></td>
+      <td>Per-segment ranges are small: in the 10M readings, device_id needs 2 B and ts 4 B per value (<code>bench/results/after-footprint.txt</code>); decode is one add; byte-aligned widths keep <code>visit()</code> to four instantiations</td>
+    </tr>
+    <tr>
+      <td>Column mutability</td>
+      <td><span class="badge badge-green">Immutable; encode at seal</span></td>
+      <td>Append into encoded columns</td>
+      <td>The width depends on the whole segment's range, which is known only at seal; raw buffers keep append simple</td>
+    </tr>
+    <tr>
+      <td>Float storage</td>
+      <td><span class="badge badge-yellow">double; float opt-in</span></td>
+      <td>Always float; automatic narrowing</td>
+      <td>float is lossy in general, so it is a per-column schema choice (<code>narrow_float</code>), never inferred</td>
     </tr>
     <tr>
       <td>Execution granularity</td>
@@ -908,49 +1421,121 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
       <td>Kernel dispatch</td>
       <td><span class="badge badge-purple">Template + generic lambda (compile-time)</span></td>
       <td>std::function; virtual call; std::visit per row</td>
-      <td>All dispatch resolves at compile time; inner loop is one instruction; compiler can SIMD-vectorise</td>
+      <td>All dispatch resolves at compile time; inner loop is a branchless compare-and-advance</td>
+    </tr>
+    <tr>
+      <td>Batch buffers</td>
+      <td><span class="badge badge-blue">Borrowed spans</span></td>
+      <td>Batch owns its column list and sel vector</td>
+      <td>No allocation or copy per batch; costs a strict "valid until next()" lifetime</td>
+    </tr>
+    <tr>
+      <td>Group state</td>
+      <td><span class="badge badge-purple">Inline in hash slot</span></td>
+      <td>Dense gid → separate state arrays</td>
+      <td>One cache line per row for a fused update; made the compiled Q4 2.33× faster than vectorized. The vectorized per-aggregate passes did not gain (footprint spec §7)</td>
+    </tr>
+    <tr>
+      <td>MEDIAN</td>
+      <td><span class="badge badge-green">Exact, block chains</span></td>
+      <td>Per-group growing arrays (no doubling or copy on growth)</td>
+      <td>Exact results both engines can match bit for bit (approximate quantiles are a non-goal); fixed 2 KiB blocks avoid doubling and copies</td>
+    </tr>
+    <tr>
+      <td>SUM(Int64)</td>
+      <td><span class="badge badge-yellow">__int128 + overflow error</span></td>
+      <td>int64 accumulator</td>
+      <td>Intermediate values may exceed int64 without harm; only a final value outside int64 is an error (<code>std::overflow_error</code> naming the group)</td>
+    </tr>
+    <tr>
+      <td>Second engine</td>
+      <td><span class="badge badge-purple">Generated C++ via clang + dlopen</span></td>
+      <td>LLVM IR + ORC JIT; compile-time templates</td>
+      <td>Redshift's approach, no new dependency, and a real compile latency to study: 45–93 ms compile + 155–230 ms first load per cold query</td>
+    </tr>
+    <tr>
+      <td>Generated filter shape</td>
+      <td><span class="badge badge-blue">Branches, as HyPer</span></td>
+      <td>Branchless</td>
+      <td>Branchless is the vectorized engine's technique; keeping them different makes the contrast measurable</td>
     </tr>
   </table>
 </section>
 
 <section id="bench">
   <h2>Benchmarks</h2>
-  <p>Query: <code>SELECT sum(value) FROM readings WHERE ts &gt; 1,705,000,000</code><br>
-  Dataset: 10M rows, 3 columns (device_id int64, ts int64, value float64), 153 segments of 65,536 rows.<br>
-  Machine: Apple Silicon (ARM), compiled with <code>-O3 -march=native</code>.</p>
+  <p>Dataset: 10M readings rows, 3 columns (device_id int64, ts int64, value float64), 153
+  segments of 65,536 rows, sorted on ts within each segment. Built with
+  <code>-O3 -march=native</code>; single-threaded unless noted. The specs report an Apple M3 Pro,
+  best of 7 runs.</p>
+
+  <h3>Storage and the filter path (wb_bench)</h3>
+  <p><code>bench/results/baseline.txt</code> (red) vs <code>bench/results/after-footprint.txt</code>
+  (green):</p>
 
   <div class="bench">
     <div class="bench-row">
-      <span class="bench-label">Load CSV (10M rows)</span>
+      <span class="bench-label">Load CSV — before</span>
       <div class="bench-bar-wrap">
-        <div class="bench-bar old" style="width:100%">~3,000 ms</div>
+        <div class="bench-bar old" style="width:100%">2,163 ms</div>
       </div>
     </div>
     <div class="bench-row">
-      <span class="bench-label">Zone-map prune (153 segs)</span>
+      <span class="bench-label">Load CSV — now</span>
       <div class="bench-bar-wrap">
-        <div class="bench-bar new" style="width:2%">&lt;1 ms</div>
+        <div class="bench-bar new" style="width:52%">1,130 ms</div>
       </div>
     </div>
     <div class="bench-row">
-      <span class="bench-label">Filter + sum (5.1M rows)</span>
+      <span class="bench-label">Column memory — before</span>
       <div class="bench-bar-wrap">
-        <div class="bench-bar new" style="width:12%">~7.5 ms</div>
+        <div class="bench-bar old" style="width:100%">228.9 MiB (24.00 B/row)</div>
+      </div>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">Column memory — now</span>
+      <div class="bench-bar-wrap">
+        <div class="bench-bar new" style="width:55%">125.4 MiB (13.15 B/row)</div>
+      </div>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">ts &gt; mid sum(value) — before</span>
+      <div class="bench-bar-wrap">
+        <div class="bench-bar old" style="width:100%">12.9 ms</div>
+      </div>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">ts &gt; mid sum(value) — now</span>
+      <div class="bench-bar-wrap">
+        <div class="bench-bar new" style="width:38%">4.9 ms</div>
       </div>
     </div>
   </div>
 
-  <p>The dominant cost is CSV parsing, not query execution. The query itself (pruning + filter + sum
-  over ~5M rows) runs in ~7.5 ms, of which most is DRAM bandwidth — reading ~41 MB of ts column
-  data at ~50 GB/s gives a ~0.8 ms floor.</p>
+  <p>Column memory fell because of frame-of-reference encoding (device_id 19.1 MiB, ts 30.1 MiB;
+  value stays 76.3 MiB as double). The query still prunes about half the segments
+  (5,046,926 rows survive).</p>
+
+  <h3>Vectorized vs compiled</h3>
+  <p>After the footprint fixes, from <code>docs/superpowers/specs/2026-10-21-footprint-fixes-design.md</code>
+  §7 (raw: <code>bench/results/codegen.txt</code>). All compiled results matched the vectorized
+  engine bit for bit.</p>
+  <table>
+    <tr><th>Query</th><th>vec ms</th><th>cg-O3 ms</th><th>cg speedup</th></tr>
+    <tr><td>Q4 GROUP BY device SUM/COUNT</td><td>28.8</td><td>12.4</td><td><span class="badge badge-purple">2.33×</span></td></tr>
+    <tr><td>Q5 join + GROUP BY region</td><td>11.5</td><td>12.4</td><td><span class="badge badge-blue">0.93×</span></td></tr>
+    <tr><td>Q7 MEDIAN by device</td><td>158.8</td><td>130.8</td><td><span class="badge badge-purple">1.21×</span></td></tr>
+  </table>
 
   <div class="callout">
     <strong>Bottleneck analysis</strong>
-    We are memory-bandwidth bound on the filter, not compute-bound. The zone-map prune
-    saves ~49% of segment reads. Within surviving segments the filter kernel runs at
-    close to memory-line throughput. Further gains require either reducing data volume
-    (smaller types, dictionary encoding) or reducing the number of rows that reach the
-    filter (tighter zone maps via sorted ingestion order).
+    Filters favour the vectorized engine (branchless selection on unsorted data). Grouped
+    aggregation favours the compiled engine: its fused per-row update touches one inline slot,
+    while the vectorized engine makes one pass per aggregate. Joins are now a tie, since the
+    earlier 1.7× compiled win on Q5 was mostly the vectorized join's per-batch materialisation.
+    MEDIAN is dominated by collecting values and selection, which neither execution model changes.
+    A cold compiled query still pays about 200–320 ms of compile + load, so it repays only on
+    repeated runs.
   </div>
 </section>
 
@@ -958,11 +1543,24 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
   <h2>What's Next</h2>
   <div class="card-grid">
     <div class="card">
-      <h4>Hash aggregation</h4>
+      <h4>Fused vectorized SUM/COUNT</h4>
       <p style="font-size:13px;margin:0">
-        <code>GROUP BY device_id</code> — hash table keyed on the group column,
-        accumulate sum/count per bucket.
-        First operator that produces <em>more</em> rows than it consumes (bucket enumeration phase).
+        Vectorized Q4 missed its target (28.8 ms): pass 1 alone takes 21.2 ms. A fused path for
+        SUM/COUNT-only aggregate lists could recover the old 18.9 ms loop.
+      </p>
+    </div>
+    <div class="card">
+      <h4>Eager loads in generated code</h4>
+      <p style="font-size:13px;margin:0">
+        Emit branch-free predicate evaluation for Q2/Q3, where lazy loading keeps an
+        unpredictable branch in the generated loop.
+      </p>
+    </div>
+    <div class="card">
+      <h4>Cheaper library load</h4>
+      <p style="font-size:13px;margin:0">
+        The first <code>dlopen</code> of a new library (155–230 ms) costs more than compiling it.
+        Code-signing or pre-warming generated libraries may cut <code>load_ms</code>.
       </p>
     </div>
     <div class="card">
@@ -974,19 +1572,19 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
       </p>
     </div>
     <div class="card">
-      <h4>AND-of-predicates</h4>
+      <h4>Single-pass conjunctions</h4>
       <p style="font-size:13px;margin:0">
-        Chain two <code>FilterOperator</code>s, or add a
-        <code>ConjunctivePredicate</code> that applies multiple conditions in one kernel
-        pass (avoids two selection-vector passes over the same data).
+        A plan Filter's conjuncts are lowered to chained <code>FilterOperator</code>s today.
+        A <code>ConjunctivePredicate</code> that applies all conditions in one kernel pass would
+        avoid a selection-vector pass per conjunct.
       </p>
     </div>
     <div class="card">
-      <h4>Sorted ingestion / clustering</h4>
+      <h4>Cross-segment clustering</h4>
       <p style="font-size:13px;margin:0">
-        Sort rows by the most-frequently-queried column before sealing.
-        Zone maps become non-overlapping across segments —
-        binary-search-style pruning instead of linear scan.
+        Rows are sorted by the sort key <em>within</em> each segment at seal. Sorting across
+        segments would make zone maps non-overlapping, so the scan could binary-search
+        segments instead of checking each one.
       </p>
     </div>
     <div class="card">
@@ -1001,7 +1599,7 @@ b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <s
       <h4>Parquet / binary format</h4>
       <p style="font-size:13px;margin:0">
         mmap a pre-columnarised binary file rather than parsing CSV.
-        Eliminates the 3-second parse time; enables OS-level page cache for repeated queries.
+        Eliminates the ~1.1 s parse of 10M rows; enables OS-level page cache for repeated queries.
       </p>
     </div>
   </div>
