@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wb — Columnar Engine Internals</title>
+<style>
+  :root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3a;
+    --accent:   #7c6af7;
+    --accent2:  #4fc3f7;
+    --green:    #56d364;
+    --yellow:   #e3b341;
+    --red:      #f85149;
+    --text:     #cdd9e5;
+    --muted:    #768390;
+    --code-bg:  #161b22;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+  }
+
+  /* Layout */
+  .layout { display: flex; min-height: 100vh; }
+  nav {
+    width: 240px;
+    min-height: 100vh;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 24px 0;
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  nav .logo {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    padding: 0 20px 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+    letter-spacing: 0.5px;
+  }
+  nav .logo span { color: var(--muted); font-weight: 400; font-size: 12px; display: block; }
+  nav a {
+    display: block;
+    padding: 6px 20px;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  nav a:hover { color: var(--text); background: rgba(124,106,247,0.07); }
+  nav a.active { color: var(--accent); border-left-color: var(--accent); }
+  nav .section-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 16px 20px 4px;
+  }
+
+  main { flex: 1; max-width: 900px; padding: 48px 56px; }
+
+  /* Typography */
+  h1 { font-size: 28px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+  h2 {
+    font-size: 20px; font-weight: 600; color: #fff;
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 16px; font-weight: 600; color: var(--accent2); margin: 28px 0 10px; }
+  h4 { font-size: 14px; font-weight: 600; color: var(--yellow); margin: 20px 0 8px; }
+  p { margin-bottom: 14px; color: var(--text); }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 32px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Code */
+  code {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 13px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    color: var(--accent2);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    overflow-x: auto;
+    margin: 16px 0 24px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+  .kw { color: #c792ea; }
+  .ty { color: #82aaff; }
+  .cm { color: #546e7a; font-style: italic; }
+  .st { color: #c3e88d; }
+  .nm { color: #f78c6c; }
+  .fn { color: #82aaff; }
+
+  /* Diagram boxes */
+  .diagram {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    margin: 16px 0 24px;
+    font-family: "SF Mono", monospace;
+    font-size: 12px;
+    line-height: 1.8;
+    overflow-x: auto;
+  }
+  .diagram .box {
+    display: inline-block;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 2px 10px;
+    color: var(--accent);
+  }
+  .diagram .box2 {
+    display: inline-block;
+    border: 1px solid var(--accent2);
+    border-radius: 4px;
+    padding: 2px 10px;
+    color: var(--accent2);
+  }
+  .diagram .box3 {
+    display: inline-block;
+    border: 1px solid var(--green);
+    border-radius: 4px;
+    padding: 2px 10px;
+    color: var(--green);
+  }
+  .diagram .arr { color: var(--muted); }
+
+  /* Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0 24px; }
+  .card-grid .card { margin: 0; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; margin: 16px 0 24px; font-size: 14px; }
+  th {
+    background: var(--surface);
+    color: var(--muted);
+    text-align: left;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border);
+  }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+
+  /* Badges */
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .badge-green { background: rgba(86,211,100,0.15); color: var(--green); }
+  .badge-blue  { background: rgba(79,195,247,0.15); color: var(--accent2); }
+  .badge-purple{ background: rgba(124,106,247,0.15); color: var(--accent); }
+  .badge-yellow{ background: rgba(227,179,65,0.15);  color: var(--yellow); }
+  .badge-red   { background: rgba(248,81,73,0.15);   color: var(--red); }
+
+  /* Callouts */
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: rgba(124,106,247,0.07);
+    border-radius: 0 6px 6px 0;
+    padding: 14px 18px;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  .callout.warn {
+    border-left-color: var(--yellow);
+    background: rgba(227,179,65,0.07);
+  }
+  .callout.success {
+    border-left-color: var(--green);
+    background: rgba(86,211,100,0.07);
+  }
+  .callout strong { display: block; margin-bottom: 4px; color: #fff; }
+
+  /* File tree */
+  .filetree {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    font-family: "SF Mono", monospace;
+    font-size: 13px;
+    line-height: 2;
+  }
+  .filetree .dir  { color: var(--accent2); }
+  .filetree .file { color: var(--text); }
+  .filetree .note { color: var(--muted); font-size: 12px; }
+
+  /* Memory layout */
+  .mem-row {
+    display: flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 6px 0;
+    font-family: monospace;
+    font-size: 12px;
+  }
+  .mem-label {
+    background: var(--surface);
+    color: var(--muted);
+    padding: 6px 12px;
+    min-width: 90px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+  }
+  .mem-cell {
+    padding: 6px 14px;
+    display: flex;
+    align-items: center;
+    border-right: 1px solid var(--border);
+    flex: 1;
+  }
+  .mem-cell:last-child { border-right: none; }
+  .mem-cell.int64  { background: rgba(124,106,247,0.1); color: var(--accent); }
+  .mem-cell.f64    { background: rgba(79,195,247,0.1);  color: var(--accent2); }
+  .mem-cell.str    { background: rgba(86,211,100,0.1);  color: var(--green); }
+  .mem-cell.zone   { background: rgba(227,179,65,0.1);  color: var(--yellow); }
+
+  /* Benchmark bar */
+  .bench { margin: 16px 0 24px; }
+  .bench-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; font-size: 13px; }
+  .bench-label { width: 220px; color: var(--muted); flex-shrink: 0; }
+  .bench-bar-wrap { flex: 1; background: var(--border); border-radius: 4px; height: 20px; overflow: hidden; }
+  .bench-bar { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 8px; font-size: 11px; font-weight: 600; }
+  .bench-bar.old  { background: rgba(248,81,73,0.4); color: var(--red); }
+  .bench-bar.new  { background: rgba(86,211,100,0.4); color: var(--green); }
+
+  section { margin-bottom: 12px; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── Sidebar ── -->
+<nav>
+  <div class="logo">wb <span>columnar engine</span></div>
+
+  <div class="section-label">Overview</div>
+  <a href="#intro">Introduction</a>
+  <a href="#files">File Structure</a>
+  <a href="#dataflow">Data Flow</a>
+
+  <div class="section-label">Storage Layer</div>
+  <a href="#types">Type System</a>
+  <a href="#vectors">Column Vectors</a>
+  <a href="#zonemaps">Zone Maps</a>
+  <a href="#segments">Segments</a>
+  <a href="#table">Table</a>
+  <a href="#csv">CSV Loader</a>
+
+  <div class="section-label">Execution Layer</div>
+  <a href="#batch">Batch</a>
+  <a href="#operator">Operator Model</a>
+  <a href="#scan">Scan Operator</a>
+  <a href="#filter">Filter Operator</a>
+  <a href="#predicate">Predicates</a>
+
+  <div class="section-label">Optimizations</div>
+  <a href="#pruning">Zone-Map Pruning</a>
+  <a href="#vectorized">Vectorized Kernels</a>
+  <a href="#projection">Column Projection</a>
+  <a href="#buffers">Buffer Reuse</a>
+
+  <div class="section-label">Decisions</div>
+  <a href="#decisions">Design Decisions</a>
+  <a href="#bench">Benchmarks</a>
+  <a href="#next">What's Next</a>
+</nav>
+
+<!-- ── Main ── -->
+<main>
+
+<section id="intro">
+  <h1>wb — Columnar Engine Internals</h1>
+  <p class="subtitle">A from-scratch columnar analytical database written in C++20.<br>
+  Covers storage layout, execution model, pruning, and vectorized filtering.</p>
+
+  <p>
+    <strong>wb</strong> is a minimal but realistic columnar query engine. It ingests CSV data
+    into immutable column-oriented segments, attaches min/max zone maps for pruning,
+    and executes queries as a pipeline of pull-based operators that pass
+    <em>batches</em> of row indices rather than materialising rows.
+  </p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Storage model</h4>
+      <p style="margin:0;font-size:13px">Column-per-file layout within segments. Each column is a typed
+      contiguous array (<code>std::vector&lt;T&gt;</code>). No row materialisation.</p>
+    </div>
+    <div class="card">
+      <h4>Execution model</h4>
+      <p style="margin:0;font-size:13px">Volcano/iterator model, but pull-at-a-<em>batch</em>
+      (not pull-at-a-row). Each <code>next()</code> call returns up to 4,096 row slots.</p>
+    </div>
+    <div class="card">
+      <h4>Pruning</h4>
+      <p style="margin:0;font-size:13px">Zone maps (exact min/max per column per segment) let
+      the scan skip entire segments before reading a single byte of column data.</p>
+    </div>
+    <div class="card">
+      <h4>Filtering</h4>
+      <p style="margin:0;font-size:13px">Template kernels with <code>std::greater&lt;&gt;</code>
+      et al. baked in at compile time. Dispatch happens once per batch, not once per row.</p>
+    </div>
+  </div>
+</section>
+
+<hr>
+
+<section id="files">
+  <h2>File Structure</h2>
+  <div class="filetree">
+    <span class="dir">src/</span><br>
+    &nbsp;&nbsp;<span class="dir">storage/</span>&nbsp;&nbsp;&nbsp;<span class="note">← persistent data layer</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">schema.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">DataType enum, ColumnDef, Schema alias</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">vector.h/cpp</span>&nbsp;&nbsp;<span class="note">Int64Vector, Float64Vector, StringVector</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">zone_map.h/cpp</span>&nbsp;<span class="note">min/max statistics per column</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">segment.h/cpp</span>&nbsp;&nbsp;<span class="note">immutable Segment + SegmentBuilder</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">table.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">ordered collection of segments</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">csv.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">streaming CSV → Table loader</span><br>
+    &nbsp;&nbsp;<span class="dir">exec/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">← query execution layer</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">operator.h</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">Operator base class + ScanRow struct</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">batch.h</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">non-owning Batch view (columns + sel vector)</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">predicate.h/cpp</span>&nbsp;<span class="note">CompareOp enum, Predicate struct, zone_map_can_match()</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">scan.h/cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">ScanOperator — segment iteration + pruning</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">filter.h/cpp</span>&nbsp;&nbsp;&nbsp;<span class="note">FilterOperator — vectorized row selection</span><br>
+    &nbsp;&nbsp;<span class="dir">tools/</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">gen.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">10M-row sensor readings CSV generator</span><br>
+    &nbsp;&nbsp;<span class="file">main.cpp</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">integration tests + benchmark harness</span><br>
+    <span class="dir">data/</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">readings.csv, bigger.csv, test.csv</span><br>
+    <span class="file">Makefile</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note">-O3 -march=native, separate wb / wb_gen / wb_test targets</span>
+  </div>
+</section>
+
+<hr>
+
+<section id="dataflow">
+  <h2>Data Flow</h2>
+  <p>From CSV on disk to a query result:</p>
+
+  <div class="diagram">
+<span style="color:var(--muted)">  INGEST                       STORAGE                        EXECUTION</span>
+
+  readings.csv
+      │
+      ▼
+  <span class="box2">load_csv()</span> ──splits──► <span class="box">SegmentBuilder</span> ──seal()──► <span class="box">Segment</span>
+                              │                          │
+                              │  append_int64()          ├─ columns_[0]  <span class="box2">Int64Vector</span>   [ts]
+                              │  append_float64()        ├─ columns_[1]  <span class="box2">Float64Vector</span> [value]
+                              │  ...per column           └─ zones_[i]    <span class="box3">ZoneMap</span>   min/max
+                              │
+                   65,536 rows per segment
+                              │
+  ┌───────────────────────────▼───────────────────────────┐
+  │                       <span class="box">Table</span>                          │
+  │   segments_[0]  segments_[1]  ...  segments_[152]     │
+  └────────────────────────┬──────────────────────────────┘
+                           │  query: ts > cutoff
+                           ▼
+                  <span class="box">ScanOperator</span>  ─zone-map-prune──► skip 75 segments
+                           │  emit Batch{col_ptrs, offset, size}
+                           ▼
+                 <span class="box">FilterOperator</span>  ──apply predicate──► set sel vector
+                           │
+                           ▼
+                      caller loop
+                    sum(value) over sel
+  </div>
+</section>
+
+<hr>
+
+<!-- ═══════ STORAGE LAYER ═══════ -->
+
+<section id="types">
+  <h2>Type System</h2>
+  <p>All column types flow from a single enum in <code>schema.h</code>:</p>
+<pre><code><span class="kw">enum class</span> <span class="ty">DataType</span> : std::uint8_t {
+    <span class="nm">Int64</span>,    <span class="cm">// 8-byte signed integer</span>
+    <span class="nm">Float64</span>,  <span class="cm">// 8-byte IEEE 754 double</span>
+    <span class="nm">String</span>,   <span class="cm">// heap-allocated std::string</span>
+};
+
+<span class="kw">struct</span> <span class="ty">ColumnDef</span> { std::string name; <span class="ty">DataType</span> type; };
+<span class="kw">using</span> <span class="ty">Schema</span> = std::vector&lt;<span class="ty">ColumnDef</span>&gt;;</code></pre>
+
+  <p>A <code>Schema</code> is just an ordered list of column definitions. Every object in the engine
+  that is aware of column types receives a <code>Schema</code> — the builder, the loader, and any
+  operator that needs to downcast a <code>Vector*</code>.</p>
+
+  <div class="callout">
+    <strong>Why only three types?</strong>
+    Three types is the minimum to demonstrate all dispatch patterns without drowning in boilerplate.
+    Adding <code>Int32</code>, <code>Boolean</code>, or <code>Timestamp</code> is mechanical — every
+    switch on <code>DataType</code> gets one new case.
+  </div>
+</section>
+
+<section id="vectors">
+  <h2>Column Vectors</h2>
+  <p>Each column type gets a concrete class that owns a <code>std::vector&lt;T&gt;</code> and
+  exposes a <code>std::span&lt;const T&gt;</code> for zero-copy read access:</p>
+
+  <div class="diagram" style="font-size:13px">
+  <span style="color:var(--muted)">/* Abstract base — no data, only type/size contract */</span>
+  <span class="box2">Vector</span>  { type() → DataType,  size() → size_t }
+       │
+       ├─ <span class="box">Int64Vector</span>   values_: vector&lt;int64_t&gt;   append(int64_t)  data() → span&lt;const int64_t&gt;
+       ├─ <span class="box">Float64Vector</span> values_: vector&lt;double&gt;    append(double)   data() → span&lt;const double&gt;
+       └─ <span class="box">StringVector</span>  values_: vector&lt;string&gt;    append(string)   data() → span&lt;const string&gt;
+  </div>
+
+  <p>Operators receive a <code>const Vector&amp;</code> via the <code>Batch</code> API. When a kernel
+  needs raw data it downcasts:</p>
+<pre><code><span class="kw">auto</span> data = <span class="kw">static_cast</span>&lt;<span class="kw">const</span> <span class="ty">Int64Vector</span>&amp;&gt;(col).<span class="fn">data</span>(); <span class="cm">// span&lt;const int64_t&gt;</span>
+<span class="ty">int64_t</span> val = data[row_index];  <span class="cm">// O(1), no bounds check in release</span></code></pre>
+
+  <div class="callout warn">
+    <strong>Downcast safety</strong>
+    The cast is safe only when the caller already checked <code>col.type() == DataType::Int64</code>.
+    Both the filter kernel dispatch and the benchmark sum loop do this check first.
+    An unchecked downcast to the wrong type is undefined behaviour.
+  </div>
+</section>
+
+<section id="zonemaps">
+  <h2>Zone Maps</h2>
+  <p>Every column in every segment carries one <code>ZoneMap</code> — the exact min and max value
+  observed. Zone maps are updated during <code>SegmentBuilder::append_*</code> and frozen at
+  <code>seal()</code> time. They never change after that.</p>
+
+<pre><code><span class="kw">class</span> <span class="ty">ZoneMap</span> {
+    <span class="ty">bool</span>     has_values_ = <span class="nm">false</span>;
+    <span class="ty">DataType</span> type_;
+    std::variant&lt;<span class="ty">int64_t</span>, <span class="ty">double</span>, std::string&gt; min_, max_;
+<span class="kw">public</span>:
+    <span class="kw">void</span> <span class="fn">observe</span>(<span class="ty">int64_t</span> v);   <span class="cm">// called for every appended value</span>
+    <span class="kw">void</span> <span class="fn">observe</span>(<span class="ty">double</span> v);
+    <span class="kw">void</span> <span class="fn">observe</span>(<span class="kw">const</span> std::string&amp; v);
+};</code></pre>
+
+  <p>At query time, <code>zone_map_can_match(zm, op, value)</code> returns <code>false</code>
+  (prune this segment) only when the zone map <em>proves</em> no row can satisfy the predicate:</p>
+
+  <table>
+    <tr><th>Op</th><th>Prune when</th><th>Intuition</th></tr>
+    <tr><td><code>col == v</code></td><td><code>v &lt; zmin || v &gt; zmax</code></td><td>v outside the segment's range</td></tr>
+    <tr><td><code>col != v</code></td><td><code>zmin == zmax == v</code></td><td>every value is v; nothing differs</td></tr>
+    <tr><td><code>col &lt; v</code></td><td><code>zmin &gt;= v</code></td><td>even the smallest value isn't less</td></tr>
+    <tr><td><code>col &lt;= v</code></td><td><code>zmin &gt; v</code></td><td>even the smallest value exceeds v</td></tr>
+    <tr><td><code>col &gt; v</code></td><td><code>zmax &lt;= v</code></td><td>even the largest value isn't greater</td></tr>
+    <tr><td><code>col &gt;= v</code></td><td><code>zmax &lt; v</code></td><td>even the largest value falls short</td></tr>
+  </table>
+
+  <div class="callout success">
+    <strong>Real-world result</strong>
+    On 10M rows with a monotonically-increasing timestamp column split into 153 segments of 65,536
+    rows each, a <code>ts &gt; midpoint</code> predicate prunes 75 of 153 segments — 49% of the
+    table skipped before reading a single byte of column data.
+  </div>
+</section>
+
+<section id="segments">
+  <h2>Segments &amp; SegmentBuilder</h2>
+  <p>A <code>Segment</code> is <strong>immutable</strong> after creation. It owns its column vectors
+  and zone maps via <code>std::unique_ptr</code> and moves them in from the builder at seal time.</p>
+
+  <div class="diagram" style="font-size:13px">
+  <span class="box">Segment</span>
+    │  num_rows_   = 65,536
+    │
+    ├─ columns_[0]  → <span class="box2">Int64Vector</span>    [ts₀, ts₁, ..., ts₆₅₅₃₅]
+    ├─ columns_[1]  → <span class="box2">Float64Vector</span>  [v₀,  v₁,  ...,  v₆₅₅₃₅]
+    │
+    ├─ zones_[0]    → <span class="box3">ZoneMap</span>  Int64   min=1700000000  max=1700065536
+    └─ zones_[1]    → <span class="box3">ZoneMap</span>  Float64 min=5.1          max=94.9
+  </div>
+
+  <p><code>SegmentBuilder</code> manages the mutable accumulation phase:</p>
+
+<pre><code><span class="ty">SegmentBuilder</span> b{schema};
+b.<span class="fn">append_int64</span>(<span class="nm">0</span>, ts);         <span class="cm">// col 0, col 1 must alternate to form rows</span>
+b.<span class="fn">append_float64</span>(<span class="nm">1</span>, value);   <span class="cm">// num_rows_ increments on col 0 append</span>
+<span class="cm">// ... 65,535 more rows ...</span>
+<span class="kw">auto</span> seg = b.<span class="fn">seal</span>();            <span class="cm">// unique_ptr&lt;Segment&gt;; builder is exhausted</span></code></pre>
+
+  <div class="callout">
+    <strong>Row counting convention</strong>
+    <code>num_rows_</code> increments when <code>col_idx == 0</code> is appended. This counts
+    <em>rows started</em>, not rows completed — consistent if someone reads
+    <code>num_rows()</code> mid-row. <code>seal()</code> asserts all columns have equal length.
+  </div>
+
+  <h4>String append — observe-before-move</h4>
+  <p>In <code>append_string</code>, the zone map observes the value <em>before</em>
+  <code>std::move</code> transfers ownership. After a move, the string is in a valid-but-unspecified
+  state (usually empty). Observing an empty string would corrupt the zone map's min with
+  <code>""</code>, which sorts before every non-empty string.</p>
+<pre><code>zones_[col_idx].<span class="fn">observe</span>(value);                          <span class="cm">// ← observe FIRST</span>
+<span class="kw">static_cast</span>&lt;<span class="ty">StringVector</span>*&gt;(columns_[col_idx].<span class="fn">get</span>())-&gt;<span class="fn">append</span>(std::<span class="fn">move</span>(value)); <span class="cm">// ← then move</span></code></pre>
+</section>
+
+<section id="table">
+  <h2>Table</h2>
+  <p>A <code>Table</code> is an ordered, append-only sequence of segments. It owns all segments
+  via <code>unique_ptr</code> and never reorders or merges them.</p>
+
+<pre><code><span class="kw">class</span> <span class="ty">Table</span> {
+    std::string                           name_;
+    <span class="ty">Schema</span>                                schema_;
+    std::vector&lt;std::unique_ptr&lt;<span class="ty">Segment</span>&gt;&gt; segments_;
+<span class="kw">public</span>:
+    <span class="kw">void</span>             <span class="fn">add_segment</span>(std::unique_ptr&lt;<span class="ty">Segment</span>&gt;);
+    <span class="kw">const</span> <span class="ty">Segment</span>&amp;  <span class="fn">segment</span>(size_t i) <span class="kw">const</span>;
+    std::size_t      <span class="fn">num_segments</span>()    <span class="kw">const</span>;
+};</code></pre>
+
+  <p>Segments are logically ordered by insertion order. There is no global index — the scan
+  operator iterates <code>segment(0) .. segment(n-1)</code> and relies on zone maps to skip
+  irrelevant ones.</p>
+</section>
+
+<section id="csv">
+  <h2>CSV Loader</h2>
+  <p><code>load_csv(table, path, rows_per_segment)</code> streams the file row by row, parsing
+  each field and appending to a <code>SegmentBuilder</code>. Every <code>rows_per_segment</code>
+  rows it calls <code>seal()</code> and starts a fresh builder.</p>
+
+  <p><strong>Key properties:</strong></p>
+  <ul style="margin:0 0 14px 20px;line-height:2">
+    <li>O(1) memory — only one segment worth of data in RAM at a time during load</li>
+    <li>Header validation — CSV column names must match schema column names in order</li>
+    <li>Partial final segment — last segment sealed even if &lt; rows_per_segment rows</li>
+    <li>Type dispatch via <code>switch(DataType)</code> per field</li>
+  </ul>
+
+  <div class="callout warn">
+    <strong>Performance note</strong>
+    Loading 10M rows takes ~3 seconds. The bottleneck is <code>std::stoll</code> /
+    <code>std::stod</code> string parsing plus <code>std::getline</code> line scanning —
+    not segment building or zone-map updates. A custom SIMD integer parser
+    (e.g. parse 8 digits in parallel) would cut this by 5–10×.
+  </div>
+</section>
+
+<hr>
+
+<!-- ═══════ EXECUTION LAYER ═══════ -->
+
+<section id="batch">
+  <h2>Batch</h2>
+  <p>A <code>Batch</code> is a <strong>non-owning view</strong> over a window of rows within a
+  segment. It holds borrowed pointers to column vectors, an offset into those arrays, and an
+  optional selection vector identifying which rows are live.</p>
+
+<pre><code><span class="kw">class</span> <span class="ty">Batch</span> {
+    std::vector&lt;<span class="kw">const</span> <span class="ty">Vector</span>*&gt;                vectors_;  <span class="cm">// borrowed, not owned</span>
+    std::optional&lt;std::vector&lt;uint32_t&gt;&gt;      sel_;      <span class="cm">// absent = all rows live</span>
+    <span class="ty">uint32_t</span>                                  offset_;   <span class="cm">// first row in column arrays</span>
+    <span class="ty">uint32_t</span>                                  size_;     <span class="cm">// row count in this batch</span>
+};</code></pre>
+
+  <div class="diagram" style="font-size:12px">
+  Segment column (65,536 elements):
+  [  ···  |  ts₄₀₉₆  ts₄₀₉₇  ···  ts₈₁₉₁  |  ···  ]
+            ▲                          ▲
+         offset=4096              offset+size=8192
+
+  Batch { offset=4096, size=4096, sel=absent }  → rows 4096..8191 are all live
+
+  After filter (only ~2000 pass ts > cutoff):
+  Batch { offset=4096, size=2014, sel=[4097, 4103, 4105, ...] }
+                                       ▲ absolute indices into the column array
+  </div>
+
+  <p><strong>Lifetime contract:</strong> a batch is valid only until the next call to
+  <code>next()</code> on any operator in the pipeline. Callers must not hold a batch across a
+  subsequent <code>next()</code> call. This allows column pointers to stay borrowed without
+  copying data.</p>
+
+  <h4>Selection vector semantics</h4>
+  <p>When <code>sel()</code> is absent, the live rows are the contiguous range
+  <code>[offset, offset + size)</code>. When present, <code>sel()[j]</code> is an absolute
+  index into the column arrays — each entry is a row that survived all filters applied so far.
+  Stacking filters is just intersection: the second filter iterates <code>sel</code> rather than
+  the full range.</p>
+</section>
+
+<section id="operator">
+  <h2>Operator Model</h2>
+  <p>Every operator inherits from <code>Operator</code>:</p>
+
+<pre><code><span class="kw">class</span> <span class="ty">Operator</span> {
+<span class="kw">public</span>:
+    <span class="kw">virtual</span> std::optional&lt;<span class="ty">Batch</span>&gt; <span class="fn">next</span>() = <span class="nm">0</span>;
+};</code></pre>
+
+  <p>This is the <strong>Volcano / iterator model</strong>, but lifted from row-at-a-time to
+  batch-at-a-time. Each call to <code>next()</code> returns one <code>Batch</code> or
+  <code>std::nullopt</code> when exhausted. The pipeline is lazy — no work happens until the
+  caller drives the loop.</p>
+
+  <div class="diagram" style="font-size:13px">
+  <span style="color:var(--muted)">// Typical query driver loop:</span>
+
+  while (auto batch = filter.<span class="fn">next</span>()) {           <span class="cm">// pulls from filter</span>
+      <span class="cm">// filter.next() internally calls scan.next()  ← pulls from scan</span>
+      <span class="cm">// scan.next() reads from the Table            ← reads from storage</span>
+      for (uint32_t i : *batch-&gt;sel())
+          sum += vals[i];
+  }
+  </div>
+</section>
+
+<section id="scan">
+  <h2>Scan Operator</h2>
+  <p>The <code>ScanOperator</code> is the only operator that touches storage. It iterates
+  segments in order, applies zone-map pruning, and emits batches of up to
+  <code>target_batch_size</code> rows (default 4,096).</p>
+
+<pre><code><span class="ty">ScanOperator</span>(
+    <span class="kw">const</span> <span class="ty">Table</span>&amp;              table,
+    std::optional&lt;<span class="ty">Predicate</span>&gt;  predicate,      <span class="cm">// used for zone-map pruning only</span>
+    <span class="ty">uint32_t</span>                  target_batch_size = <span class="nm">4096</span>,
+    std::vector&lt;size_t&gt;       projected_cols    = {}   <span class="cm">// empty = all columns</span>
+);</code></pre>
+
+  <h4>State machine inside next()</h4>
+<pre><code><span class="kw">while</span> (<span class="nm">true</span>) {
+    <span class="kw">if</span> (seg_idx_ &gt;= table_.num_segments()) <span class="kw">return</span> nullopt;  <span class="cm">// exhausted</span>
+
+    <span class="kw">if</span> (!seg_initialized_) {
+        <span class="cm">// Zone-map check: can this segment possibly match the predicate?</span>
+        <span class="kw">if</span> (predicate_ &amp;&amp; !zone_map_can_match(...)) {
+            ++segments_pruned_;  ++seg_idx_;  <span class="kw">continue</span>;  <span class="cm">// skip entire segment</span>
+        }
+        ++segments_scanned_;
+        seg_initialized_ = <span class="nm">true</span>;
+    }
+
+    remaining = seg.num_rows() - row_idx_;
+    <span class="kw">if</span> (remaining == <span class="nm">0</span>) { advance_to_next_segment(); <span class="kw">continue</span>; }
+
+    batch_size = min(remaining, target_batch_size_);
+    <span class="cm">// Borrow projected column pointers</span>
+    <span class="kw">return</span> <span class="ty">Batch</span>{vecs, offset, batch_size};   <span class="cm">// O(ncols) work</span>
+}</code></pre>
+
+  <div class="callout">
+    <strong>Projection</strong>
+    <code>projected_cols = {1, 2}</code> means the batch contains only original columns 1 and 2
+    at batch positions 0 and 1. Downstream operators must use remapped indices.
+    Saves no bandwidth unless the consumer actually reads the discarded columns' data —
+    because column data is only fetched when dereferenced, not when the pointer is borrowed.
+  </div>
+</section>
+
+<section id="filter">
+  <h2>Filter Operator</h2>
+  <p>The <code>FilterOperator</code> wraps any child operator and applies a single-column
+  predicate per batch. The critical design is that all dispatch happens <em>once per batch</em>,
+  not once per row.</p>
+
+<pre><code>std::optional&lt;<span class="ty">Batch</span>&gt; <span class="ty">FilterOperator</span>::<span class="fn">next</span>() {
+    <span class="kw">while</span> (<span class="nm">true</span>) {
+        <span class="kw">auto</span> batch = child_-&gt;<span class="fn">next</span>();
+        <span class="kw">if</span> (!batch) <span class="kw">return</span> nullopt;
+
+        <span class="kw">const</span> <span class="ty">Vector</span>&amp; col = batch-&gt;<span class="fn">column</span>(predicate_.col_idx);
+
+        <span class="cm">// ONE type dispatch + ONE op dispatch per batch:</span>
+        <span class="kw">switch</span> (col.<span class="fn">type</span>()) {
+            <span class="kw">case</span> <span class="ty">DataType</span>::<span class="nm">Int64</span>: {
+                <span class="kw">auto</span> data = <span class="kw">static_cast</span>&lt;<span class="kw">const</span> <span class="ty">Int64Vector</span>&amp;&gt;(col).<span class="fn">data</span>();
+                <span class="ty">int64_t</span> lit = std::get&lt;<span class="ty">int64_t</span>&gt;(predicate_.value);
+                <span class="fn">dispatch_op</span>(data, *batch, predicate_.op, lit, survivors_buf_);
+            }
+            <span class="cm">// ...Float64, String mirrored</span>
+        }
+
+        <span class="kw">if</span> (survivors_buf_.<span class="fn">empty</span>()) <span class="kw">continue</span>;  <span class="cm">// whole batch filtered out</span>
+        batch-&gt;<span class="fn">set_sel</span>(survivors_buf_);
+        <span class="kw">return</span> batch;
+    }
+}</code></pre>
+
+  <h4>Template kernel — the inner loop</h4>
+<pre><code><span class="kw">template</span> &lt;<span class="kw">typename</span> T, <span class="kw">typename</span> Compare&gt;
+<span class="kw">void</span> <span class="fn">filter_kernel_range</span>(span&lt;const T&gt; data, uint32_t start, uint32_t end,
+                          const T&amp; lit, Compare cmp, vector&lt;uint32_t&gt;&amp; out) {
+    out.<span class="fn">clear</span>();
+    out.<span class="fn">reserve</span>(end - start);
+    <span class="kw">for</span> (uint32_t i = start; i &lt; end; ++i)
+        <span class="kw">if</span> (<span class="fn">cmp</span>(data[i], lit)) out.<span class="fn">push_back</span>(i);
+}</code></pre>
+  <p>When instantiated as <code>filter_kernel_range&lt;int64_t, std::greater&lt;&gt;&gt;</code>,
+  the compiler sees one comparison per iteration with both operand types and the operator known
+  at compile time. At <code>-O3 -march=native</code> this loop is eligible for NEON/AVX2
+  autovectorisation.</p>
+</section>
+
+<section id="predicate">
+  <h2>Predicates</h2>
+<pre><code><span class="kw">enum class</span> <span class="ty">CompareOp</span> { Eq, Ne, Lt, Le, Gt, Ge };
+
+<span class="kw">struct</span> <span class="ty">Predicate</span> {
+    std::size_t                                col_idx;
+    <span class="ty">CompareOp</span>                                  op;
+    std::variant&lt;<span class="ty">int64_t</span>, <span class="ty">double</span>, std::string&gt; value;
+};</code></pre>
+
+  <p>A <code>Predicate</code> has two uses with <em>different col_idx namespaces</em>:</p>
+  <table>
+    <tr><th>Used by</th><th>col_idx refers to</th></tr>
+    <tr><td><code>ScanOperator</code> (zone-map pruning)</td><td>original column index in the Table/Segment</td></tr>
+    <tr><td><code>FilterOperator</code> (row selection)</td><td>batch column position (after projection remapping)</td></tr>
+  </table>
+</section>
+
+<hr>
+
+<!-- ═══════ OPTIMIZATIONS ═══════ -->
+
+<section id="pruning">
+  <h2>Zone-Map Pruning</h2>
+  <p>Zone maps are the single highest-leverage optimisation in the engine. They trade
+  <em>a few bytes of metadata per segment</em> for the ability to skip entire segments with a
+  scalar comparison at query planning time.</p>
+
+  <p>The function <code>zone_map_can_match</code> returns <code>false</code> (skip) only when
+  the interval <code>[zmin, zmax]</code> has no overlap with the predicate's satisfying set.
+  It is the dual of the filter: it proves <em>absence</em> rather than selecting presence.
+  A false negative (saying "might match" when actually no row does) is safe — you scan extra
+  rows. A false positive (saying "no match" when a row does match) would silently drop data.</p>
+
+  <div class="card">
+    <strong>10M readings benchmark</strong>
+    <p style="margin:4px 0 0; font-size:13px">
+      153 segments × 65,536 rows. Predicate: <code>ts &gt; 1,705,000,000</code> (≈midpoint).<br>
+      <strong>75 segments pruned</strong> (49%) before any column data is read.<br>
+      <strong>78 segments scanned</strong> (≈5.1M rows) — filter applied only to these.
+    </p>
+  </div>
+</section>
+
+<section id="vectorized">
+  <h2>Vectorized Filter Kernels</h2>
+  <p>The key shift from naïve to fast: moving all dispatch <em>above</em> the inner loop.</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4 style="color:var(--red)">Naïve — per row</h4>
+      <p style="font-size:13px;margin:0">
+        <code>std::visit</code> on variant (type dispatch)<br>
+        Generic lambda instantiation<br>
+        <code>static_cast</code> to typed vector<br>
+        <code>switch(op)</code> for comparison<br>
+        <em>× N rows per batch</em>
+      </p>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--green)">Vectorized — per batch</h4>
+      <p style="font-size:13px;margin:0">
+        <code>switch(col.type())</code> once<br>
+        <code>dispatch_op&lt;T&gt;</code> → <code>switch(op)</code> once<br>
+        <code>run(std::greater&lt;&gt;{})</code> baked in at compile time<br>
+        Inner loop: <code>cmp(data[i], lit)</code> only<br>
+        <em>Compiler can autovectorise the loop</em>
+      </p>
+    </div>
+  </div>
+
+  <p>The <code>auto run = [&amp;](auto cmp)</code> generic lambda is the mechanism. Each call
+  site (<code>run(std::greater&lt;&gt;{})</code>, <code>run(std::less&lt;&gt;{})</code>, etc.)
+  generates a distinct specialisation with a different <code>Compare</code> type, so no runtime
+  polymorphism reaches the inner loop body.</p>
+</section>
+
+<section id="projection">
+  <h2>Column Projection</h2>
+  <p><code>ScanOperator</code> accepts a <code>projected_cols</code> list. When non-empty, the
+  batch's column array contains only those original columns, remapped to batch positions
+  0, 1, 2, …</p>
+
+  <div class="callout warn">
+    <strong>When projection actually saves bandwidth</strong>
+    In an in-memory engine with lazy evaluation, projection only reduces data movement if
+    downstream code actually <em>reads</em> the discarded columns. Borrowing a pointer is free;
+    only dereferencing the span data incurs cache lines. For disk-based or compressed storage,
+    projection prevents decompressing irrelevant columns entirely — much larger win.
+  </div>
+</section>
+
+<section id="buffers">
+  <h2>Buffer Reuse</h2>
+  <p><code>FilterOperator</code> owns a persistent <code>std::vector&lt;uint32_t&gt; survivors_buf_</code>.
+  The kernel fills it in-place via an <code>out&amp;</code> parameter —
+  <code>out.clear()</code> resets size but preserves allocation. After warmup (a few batches),
+  the buffer's capacity stabilises at the high-water mark of survivors per batch and no further
+  heap allocations occur for the building phase.</p>
+
+  <p><code>set_sel(survivors_buf_)</code> copies the survivors into the Batch (the Batch owns its
+  sel vector independently). The copy costs <code>~survivors × 4 bytes</code> per batch but
+  allows <code>survivors_buf_</code> to retain capacity.</p>
+</section>
+
+<hr>
+
+<!-- ═══════ DECISIONS ═══════ -->
+
+<section id="decisions">
+  <h2>Design Decisions</h2>
+
+  <table>
+    <tr><th>Decision</th><th>Chosen</th><th>Alternative considered</th><th>Reason</th></tr>
+    <tr>
+      <td>Segment mutability</td>
+      <td><span class="badge badge-green">Immutable after seal</span></td>
+      <td>Mutable, in-place update</td>
+      <td>Simplifies ownership (unique_ptr, no locks), enables safe concurrent reads, matches real columnar engines (Parquet, ClickHouse)</td>
+    </tr>
+    <tr>
+      <td>Column storage</td>
+      <td><span class="badge badge-blue">std::vector&lt;T&gt;</span></td>
+      <td>Flat byte buffer + manual offsets</td>
+      <td>std::vector gives correct resizing semantics during build; <code>span</code> gives zero-copy access after seal</td>
+    </tr>
+    <tr>
+      <td>Execution granularity</td>
+      <td><span class="badge badge-purple">Batch (4,096 rows)</span></td>
+      <td>Row-at-a-time (Volcano) or full-segment</td>
+      <td>Amortises virtual call + function call overhead; fits L1 cache; enables SIMD in kernels; segments can be larger than cache</td>
+    </tr>
+    <tr>
+      <td>Selection vector</td>
+      <td><span class="badge badge-blue">vector&lt;uint32_t&gt; of row indices</span></td>
+      <td>Bitmask; boolean column</td>
+      <td>Index vector is faster when selectivity &lt;50% (avoid iterating zeros); composable across filter stages; easy to sum over</td>
+    </tr>
+    <tr>
+      <td>Zone map type</td>
+      <td><span class="badge badge-green">Exact min/max</span></td>
+      <td>Bloom filter; histogram</td>
+      <td>Exact min/max is lossless for range predicates, costs only 2 values per column per segment, zero false negatives</td>
+    </tr>
+    <tr>
+      <td>Builder lifecycle</td>
+      <td><span class="badge badge-yellow">Single-use (exhausted after seal)</span></td>
+      <td>Reusable (reset on seal)</td>
+      <td>Eliminates "append after seal" bugs; simpler state machine; caller just constructs a new builder</td>
+    </tr>
+    <tr>
+      <td>num_rows_ counter</td>
+      <td><span class="badge badge-blue">Increment on col 0 append</span></td>
+      <td>Increment on last-column append</td>
+      <td>"Rows started" semantics — counter is never behind mid-row; seal() asserts column lengths equal as correctness check</td>
+    </tr>
+    <tr>
+      <td>Kernel dispatch</td>
+      <td><span class="badge badge-purple">Template + generic lambda (compile-time)</span></td>
+      <td>std::function; virtual call; std::visit per row</td>
+      <td>All dispatch resolves at compile time; inner loop is one instruction; compiler can SIMD-vectorise</td>
+    </tr>
+  </table>
+</section>
+
+<section id="bench">
+  <h2>Benchmarks</h2>
+  <p>Query: <code>SELECT sum(value) FROM readings WHERE ts &gt; 1,705,000,000</code><br>
+  Dataset: 10M rows, 3 columns (device_id int64, ts int64, value float64), 153 segments of 65,536 rows.<br>
+  Machine: Apple Silicon (ARM), compiled with <code>-O3 -march=native</code>.</p>
+
+  <div class="bench">
+    <div class="bench-row">
+      <span class="bench-label">Load CSV (10M rows)</span>
+      <div class="bench-bar-wrap">
+        <div class="bench-bar old" style="width:100%">~3,000 ms</div>
+      </div>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">Zone-map prune (153 segs)</span>
+      <div class="bench-bar-wrap">
+        <div class="bench-bar new" style="width:2%">&lt;1 ms</div>
+      </div>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">Filter + sum (5.1M rows)</span>
+      <div class="bench-bar-wrap">
+        <div class="bench-bar new" style="width:12%">~7.5 ms</div>
+      </div>
+    </div>
+  </div>
+
+  <p>The dominant cost is CSV parsing, not query execution. The query itself (pruning + filter + sum
+  over ~5M rows) runs in ~7.5 ms, of which most is DRAM bandwidth — reading ~41 MB of ts column
+  data at ~50 GB/s gives a ~0.8 ms floor.</p>
+
+  <div class="callout">
+    <strong>Bottleneck analysis</strong>
+    We are memory-bandwidth bound on the filter, not compute-bound. The zone-map prune
+    saves ~49% of segment reads. Within surviving segments the filter kernel runs at
+    close to memory-line throughput. Further gains require either reducing data volume
+    (smaller types, dictionary encoding) or reducing the number of rows that reach the
+    filter (tighter zone maps via sorted ingestion order).
+  </div>
+</section>
+
+<section id="next">
+  <h2>What's Next</h2>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Hash aggregation</h4>
+      <p style="font-size:13px;margin:0">
+        <code>GROUP BY device_id</code> — hash table keyed on the group column,
+        accumulate sum/count per bucket.
+        First operator that produces <em>more</em> rows than it consumes (bucket enumeration phase).
+      </p>
+    </div>
+    <div class="card">
+      <h4>Projection operator</h4>
+      <p style="font-size:13px;margin:0">
+        Explicit <code>ProjectOperator</code> that materialises only the columns
+        referenced downstream. Enables proper column-elimination before storage access
+        for I/O-bound workloads.
+      </p>
+    </div>
+    <div class="card">
+      <h4>AND-of-predicates</h4>
+      <p style="font-size:13px;margin:0">
+        Chain two <code>FilterOperator</code>s, or add a
+        <code>ConjunctivePredicate</code> that applies multiple conditions in one kernel
+        pass (avoids two selection-vector passes over the same data).
+      </p>
+    </div>
+    <div class="card">
+      <h4>Sorted ingestion / clustering</h4>
+      <p style="font-size:13px;margin:0">
+        Sort rows by the most-frequently-queried column before sealing.
+        Zone maps become non-overlapping across segments —
+        binary-search-style pruning instead of linear scan.
+      </p>
+    </div>
+    <div class="card">
+      <h4>Dictionary encoding</h4>
+      <p style="font-size:13px;margin:0">
+        Replace <code>StringVector</code> with <code>DictVector</code> — store
+        unique strings once, encode each row as a 16-bit integer. Cuts bandwidth and
+        makes string comparison cheap.
+      </p>
+    </div>
+    <div class="card">
+      <h4>Parquet / binary format</h4>
+      <p style="font-size:13px;margin:0">
+        mmap a pre-columnarised binary file rather than parsing CSV.
+        Eliminates the 3-second parse time; enables OS-level page cache for repeated queries.
+      </p>
+    </div>
+  </div>
+</section>
+
+</main>
+</div>
+
+<script>
+  // Highlight active nav link on scroll
+  const sections = document.querySelectorAll('section[id]');
+  const navLinks = document.querySelectorAll('nav a');
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        navLinks.forEach(a => a.classList.remove('active'));
+        const link = document.querySelector('nav a[href="#' + e.target.id + '"]');
+        if (link) link.classList.add('active');
+      }
+    });
+  }, { threshold: 0.3 });
+  sections.forEach(s => obs.observe(s));
+</script>
+</body>
+</html>
