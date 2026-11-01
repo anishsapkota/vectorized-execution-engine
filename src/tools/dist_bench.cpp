@@ -3,10 +3,8 @@
 //   ./wb_dist [--nodes N] [--slices S] [--orders ROWS] [--customers ROWS] [--skew EXP]
 //             [--experiment all|strategies|skew|crossover]
 
-#include <cmath>
 #include <cstdio>
 #include <iostream>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -14,9 +12,8 @@
 #include "dist/dist_join.h"
 #include "dist/distribute.h"
 #include "dist/planner.h"
-#include "storage/segment.h"
-#include "storage/table.h"
 #include "todo.h"
+#include "tools/datagen.h"
 
 using namespace wb;
 
@@ -43,40 +40,6 @@ Options parse(int argc, char** argv) {
         else throw std::invalid_argument("unknown flag " + flag);
     }
     return options;
-}
-
-// orders(customer_id INT64, amount FLOAT64). With exponent 1 customer ids are uniform; larger
-// exponents push orders toward low ids, the same power trick as tools/gen.cpp.
-std::unique_ptr<Table> make_orders(std::int64_t rows, std::int64_t customers, double exponent) {
-    auto table = std::make_unique<Table>(
-        "orders", Schema{{"customer_id", DataType::Int64}, {"amount", DataType::Float64}});
-    std::mt19937_64                        rng{42};
-    std::uniform_real_distribution<double> unit{0.0, 1.0};
-    for (std::int64_t start = 0; start < rows; start += 65536) {
-        SegmentBuilder builder{table->schema()};
-        for (std::int64_t i = start; i < std::min(rows, start + 65536); ++i) {
-            const auto id = static_cast<std::int64_t>(std::pow(unit(rng), exponent) * customers);
-            builder.append_int64(0, id);
-            builder.append_float64(1, unit(rng) * 100.0);
-        }
-        table->add_segment(builder.seal(std::nullopt, 8192));
-    }
-    return table;
-}
-
-// customers(customer_id INT64, region INT64), ids 0..rows-1.
-std::unique_ptr<Table> make_customers(std::int64_t rows) {
-    auto table = std::make_unique<Table>(
-        "customers", Schema{{"customer_id", DataType::Int64}, {"region", DataType::Int64}});
-    for (std::int64_t start = 0; start < rows; start += 65536) {
-        SegmentBuilder builder{table->schema()};
-        for (std::int64_t id = start; id < std::min(rows, start + 65536); ++id) {
-            builder.append_int64(0, id);
-            builder.append_int64(1, id % 50);
-        }
-        table->add_segment(builder.seal(std::nullopt, 8192));
-    }
-    return table;
 }
 
 double mb(std::uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }

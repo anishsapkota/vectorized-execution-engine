@@ -1,0 +1,1322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>wb — System Visualizer</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --purple: #a371f7; --blue: #79c0ff; --green: #56d364;
+  --yellow: #e3b341; --red: #f85149; --orange: #ffa657;
+  --text: #c9d1d9; --muted: #8b949e;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; line-height: 1.6; }
+
+/* Nav */
+.topnav { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 32px; display: flex; gap: 4px; overflow-x: auto; position: sticky; top: 0; z-index: 100; }
+.topnav a { color: var(--muted); text-decoration: none; padding: 14px 16px; font-size: 13px; white-space: nowrap; border-bottom: 2px solid transparent; transition: all .15s; }
+.topnav a:hover, .topnav a.active { color: var(--text); border-bottom-color: var(--purple); }
+.topnav .logo { color: var(--purple); font-weight: 700; font-size: 15px; padding: 14px 20px 14px 0; border-right: 1px solid var(--border); margin-right: 8px; }
+
+/* Layout */
+.page { max-width: 1100px; margin: 0 auto; padding: 40px 32px; }
+section { margin-bottom: 64px; }
+h2 { font-size: 22px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+.section-subtitle { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+h3 { font-size: 15px; font-weight: 600; color: var(--blue); margin: 28px 0 12px; }
+p { color: var(--text); margin-bottom: 12px; line-height: 1.7; }
+code { font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; background: #21262d; border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; color: var(--orange); }
+
+/* Cards and containers */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; margin-bottom: 16px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+
+/* Mermaid */
+.mermaid-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin: 16px 0 24px; overflow-x: auto; }
+.mermaid { display: flex; justify-content: center; }
+
+/* Memory layout tables */
+.mem-table { width: 100%; border-collapse: collapse; font-family: "SF Mono", monospace; font-size: 12px; margin: 8px 0 20px; }
+.mem-table th { background: #21262d; color: var(--muted); padding: 8px 12px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--border); }
+.mem-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.mem-table tr:last-child td { border-bottom: none; }
+.mem-table tr:hover td { background: rgba(255,255,255,.03); }
+.t-int64  { color: var(--blue); }
+.t-f64    { color: var(--green); }
+.t-str    { color: var(--orange); }
+.t-zone   { color: var(--yellow); }
+.t-idx    { color: var(--purple); }
+.t-sel    { color: var(--red); }
+.t-muted  { color: var(--muted); }
+
+/* Column block visualizer */
+.col-blocks { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0 20px; }
+.col-block { border-radius: 6px; overflow: hidden; border: 1px solid var(--border); min-width: 120px; }
+.col-header { padding: 6px 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+.col-header.int64  { background: rgba(121,192,255,.15); color: var(--blue); }
+.col-header.f64    { background: rgba(86,211,100,.15); color: var(--green); }
+.col-header.str    { background: rgba(255,166,87,.15); color: var(--orange); }
+.col-cell { padding: 5px 10px; font-family: monospace; font-size: 13px; border-bottom: 1px solid var(--border); }
+.col-cell:last-child { border-bottom: none; }
+.col-cell.highlighted { background: rgba(163,113,247,.2); color: var(--purple); font-weight: 600; }
+.col-cell.filtered-out { color: var(--muted); text-decoration: line-through; opacity: .5; }
+
+/* Batch visualizer */
+.batch-vis { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; margin: 12px 0 20px; }
+.batch-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; min-width: 200px; }
+.batch-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 10px; }
+.batch-field { margin: 4px 0; font-family: monospace; font-size: 12px; }
+.batch-field .key { color: var(--muted); }
+.batch-field .val { color: var(--text); }
+.sel-vec { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.sel-chip { background: rgba(248,81,73,.2); color: var(--red); border-radius: 3px; padding: 2px 6px; font-size: 11px; font-family: monospace; }
+
+/* Zone map */
+.zone-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-family: monospace; font-size: 12px; }
+.zone-label { color: var(--muted); width: 80px; flex-shrink: 0; }
+.zone-bar-wrap { flex: 1; height: 20px; background: #21262d; border-radius: 3px; position: relative; border: 1px solid var(--border); }
+.zone-bar { height: 100%; border-radius: 3px; display: flex; align-items: center; padding: 0 6px; font-size: 10px; font-weight: 600; }
+.zone-values { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.zone-prune { opacity: .35; }
+
+/* Arrow */
+.arrow { text-align: center; font-size: 24px; color: var(--muted); margin: 8px 0; }
+.arrow-right { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; margin: 8px 0; }
+.arrow-right::before { content: '→'; font-size: 18px; }
+
+/* Pipeline */
+.pipeline { display: flex; align-items: stretch; gap: 0; margin: 20px 0; overflow-x: auto; }
+.pipe-op { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 160px; flex-shrink: 0; }
+.pipe-op .op-name { font-weight: 700; font-size: 13px; color: #fff; margin-bottom: 6px; }
+.pipe-op .op-detail { font-size: 11px; color: var(--muted); line-height: 1.5; }
+.pipe-arrow { display: flex; align-items: center; padding: 0 8px; color: var(--muted); font-size: 20px; flex-shrink: 0; }
+.pipe-data { background: rgba(163,113,247,.08); border: 1px dashed rgba(163,113,247,.4); border-radius: 6px; padding: 10px 14px; font-size: 11px; font-family: monospace; color: var(--purple); min-width: 140px; flex-shrink: 0; }
+.pipe-data .pd-label { font-size: 10px; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+
+/* Step indicator */
+.steps { counter-reset: step; }
+.step { counter-increment: step; margin: 24px 0; padding-left: 44px; position: relative; }
+.step::before { content: counter(step); position: absolute; left: 0; top: 2px; width: 28px; height: 28px; background: var(--purple); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #fff; line-height: 28px; text-align: center; }
+.step h4 { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 8px; }
+
+/* Callout */
+.callout { border-left: 3px solid var(--purple); background: rgba(163,113,247,.07); border-radius: 0 6px 6px 0; padding: 12px 16px; margin: 12px 0; font-size: 13px; }
+.callout.green { border-color: var(--green); background: rgba(86,211,100,.07); }
+.callout.yellow { border-color: var(--yellow); background: rgba(227,179,65,.07); }
+.callout strong { color: #fff; display: block; margin-bottom: 2px; }
+
+/* Tag */
+.tag { display: inline-block; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 10px; margin-right: 4px; }
+.tag-int64  { background: rgba(121,192,255,.15); color: var(--blue); }
+.tag-f64    { background: rgba(86,211,100,.15);  color: var(--green); }
+.tag-str    { background: rgba(255,166,87,.15);  color: var(--orange); }
+
+hr { border: none; border-top: 1px solid var(--border); margin: 48px 0; }
+</style>
+</head>
+<body>
+
+<div class="topnav">
+  <span class="logo">wb</span>
+  <a href="#storage" class="active">Storage</a>
+  <a href="#segment">Segment</a>
+  <a href="#zonemaps">Zone Maps</a>
+  <a href="#index">Primary Index</a>
+  <a href="#row-model">Row Model</a>
+  <a href="#batch">Batch Model</a>
+  <a href="#pipeline">Pipeline</a>
+  <a href="#e2e">End-to-End</a>
+  <a href="#hashagg">HashAgg</a>
+  <a href="#hashjoin">HashJoin</a>
+  <a href="#compiled">Compiled</a>
+</div>
+
+<div class="page">
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="storage">
+<h2>Storage Architecture</h2>
+<p class="section-subtitle">How a Table decomposes into immutable columnar Segments on the heap.</p>
+
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph TD
+    T["🗄️ Table<br/><i>sensors</i><br/>schema: device_id INT64, ts INT64, value FLOAT64<br/>sort_key_col: nullopt"] --> S0
+    T --> S1
+    T --> S2
+
+    S0["📦 Segment 0<br/>rows: 0–4"]
+    S1["📦 Segment 1<br/>rows: 4–8"]
+    S2["📦 Segment 2<br/>rows: 8–12"]
+
+    S0 --> C00["Int64Vector FOR<br/>device_id<br/>[1,1,2,2]<br/>base 1, u8 codes"]
+    S0 --> C01["Int64Vector FOR<br/>ts<br/>[800,900,850,950]<br/>base 800, u8 codes"]
+    S0 --> C02["Float64Vector<br/>value<br/>[10.5,20.3,15.0,8.7]<br/>double"]
+    S0 --> Z0["ZoneMap ×3<br/>ts: [800,950]"]
+
+    S1 --> C10["Int64Vector FOR<br/>device_id<br/>[1,2,3,3]<br/>base 1, u8 codes"]
+    S1 --> C11["Int64Vector FOR<br/>ts<br/>[1050,1100,1020,1200]<br/>base 1020, u8 codes"]
+    S1 --> C12["Float64Vector<br/>value<br/>[5.1,9.9,3.3,7.7]<br/>double"]
+    S1 --> Z1["ZoneMap ×3<br/>ts: [1020,1200]"]
+
+    S2 --> C20["Int64Vector FOR<br/>device_id<br/>[2,3,1,3]<br/>base 1, u8 codes"]
+    S2 --> C21["Int64Vector FOR<br/>ts<br/>[1300,1400,1350,1450]<br/>base 1300, u8 codes"]
+    S2 --> C22["Float64Vector<br/>value<br/>[12.0,6.5,18.2,4.4]<br/>double"]
+    S2 --> Z2["ZoneMap ×3<br/>ts: [1300,1450]"]
+
+    style T fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style S0 fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style S1 fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style S2 fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style C00 fill:#0d1117,stroke:#30363d,color:#79c0ff
+    style C01 fill:#0d1117,stroke:#30363d,color:#79c0ff
+    style C02 fill:#0d1117,stroke:#30363d,color:#56d364
+    style C10 fill:#0d1117,stroke:#30363d,color:#79c0ff
+    style C11 fill:#0d1117,stroke:#30363d,color:#79c0ff
+    style C12 fill:#0d1117,stroke:#30363d,color:#56d364
+    style C20 fill:#0d1117,stroke:#30363d,color:#79c0ff
+    style C21 fill:#0d1117,stroke:#30363d,color:#79c0ff
+    style C22 fill:#0d1117,stroke:#30363d,color:#56d364
+    style Z0 fill:#0d1117,stroke:#e3b341,color:#e3b341
+    style Z1 fill:#0d1117,stroke:#e3b341,color:#e3b341
+    style Z2 fill:#0d1117,stroke:#e3b341,color:#e3b341
+</div>
+</div>
+
+<div class="callout">
+  <strong>Key property: columnar, not row-oriented</strong>
+  All <code>device_id</code> values of a segment live together in one contiguous code array
+  (frame-of-reference encoded, see below). All <code>ts</code> values in another. A query that only
+  reads <code>ts</code> and <code>value</code> never touches <code>device_id</code> memory — even if
+  it's in the same segment.
+</div>
+
+<p style="font-size:13px;color:var(--muted)">
+  The toy table above uses 4-row segments so every value fits on screen. The benchmarks load
+  <code>readings</code> into 65,536-row segments (<code>load_csv(readings, csv, 65536)</code>),
+  so 10M rows make 153 segments.
+</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="segment">
+<h2>Segment — Memory Layout</h2>
+<p class="section-subtitle">What Segment 1 actually looks like in memory. Columns are separate, immutable heap arrays built at <code>seal()</code>; the Segment object only holds pointers. Int64 columns store compressed codes, not raw values.</p>
+
+<h3>Segment 1 (rows with ts 1020–1200)</h3>
+
+<div class="col-blocks">
+  <div class="col-block">
+    <div class="col-header int64">col[0] — device_id <span style="font-weight:400;opacity:.7">Int64 · base 1 · u8</span></div>
+    <div class="col-cell">row 0 → code <span class="t-int64">0</span> <span class="t-muted">= 1</span></div>
+    <div class="col-cell">row 1 → code <span class="t-int64">1</span> <span class="t-muted">= 2</span></div>
+    <div class="col-cell">row 2 → code <span class="t-int64">2</span> <span class="t-muted">= 3</span></div>
+    <div class="col-cell">row 3 → code <span class="t-int64">2</span> <span class="t-muted">= 3</span></div>
+  </div>
+  <div class="col-block">
+    <div class="col-header int64">col[1] — ts <span style="font-weight:400;opacity:.7">Int64 · base 1020 · u8</span></div>
+    <div class="col-cell">row 0 → code <span class="t-int64">30</span> <span class="t-muted">= 1050</span></div>
+    <div class="col-cell">row 1 → code <span class="t-int64">80</span> <span class="t-muted">= 1100</span></div>
+    <div class="col-cell">row 2 → code <span class="t-int64">0</span> <span class="t-muted">= 1020</span></div>
+    <div class="col-cell">row 3 → code <span class="t-int64">180</span> <span class="t-muted">= 1200</span></div>
+  </div>
+  <div class="col-block">
+    <div class="col-header f64">col[2] — value <span style="font-weight:400;opacity:.7">Float64 · double</span></div>
+    <div class="col-cell">row 0 → <span class="t-f64">5.1</span></div>
+    <div class="col-cell">row 1 → <span class="t-f64">9.9</span></div>
+    <div class="col-cell">row 2 → <span class="t-f64">3.3</span></div>
+    <div class="col-cell">row 3 → <span class="t-f64">7.7</span></div>
+  </div>
+  <div class="col-block" style="border-color:var(--yellow)">
+    <div class="col-header" style="background:rgba(227,179,65,.15);color:var(--yellow)">zones_[1] — ts ZoneMap</div>
+    <div class="col-cell"><span class="t-zone">min = 1020</span></div>
+    <div class="col-cell"><span class="t-zone">max = 1200</span></div>
+    <div class="col-cell t-muted" style="font-size:11px">has_values_ = true</div>
+    <div class="col-cell t-muted" style="font-size:11px">type_ = Int64</div>
+  </div>
+</div>
+
+<h3>C++ object layout</h3>
+<table class="mem-table">
+  <tr><th>Field</th><th>Type</th><th>Value / Contents</th></tr>
+  <tr><td><code>num_rows_</code></td><td class="t-muted">std::size_t</td><td>4</td></tr>
+  <tr><td><code>columns_[0]</code></td><td class="t-int64">unique_ptr&lt;Vector&gt; → Int64Vector</td><td><code>base_</code>=1, <code>codes_</code> = vector&lt;uint8_t&gt; [0, 1, 2, 2]</td></tr>
+  <tr><td><code>columns_[1]</code></td><td class="t-int64">unique_ptr&lt;Vector&gt; → Int64Vector</td><td><code>base_</code>=1020, <code>codes_</code> = vector&lt;uint8_t&gt; [30, 80, 0, 180]</td></tr>
+  <tr><td><code>columns_[2]</code></td><td class="t-f64">unique_ptr&lt;Vector&gt; → Float64Vector</td><td><code>values_</code> = vector&lt;double&gt; [5.1, 9.9, 3.3, 7.7]</td></tr>
+  <tr><td><code>zones_[0]</code></td><td class="t-zone">ZoneMap</td><td>device_id: min=1 max=3</td></tr>
+  <tr><td><code>zones_[1]</code></td><td class="t-zone">ZoneMap</td><td>ts: min=1020 max=1200</td></tr>
+  <tr><td><code>zones_[2]</code></td><td class="t-zone">ZoneMap</td><td>value: min=3.3 max=9.9</td></tr>
+  <tr><td><code>primary_index_</code></td><td class="t-idx">vector&lt;IndexEntry&gt;</td><td>[] (empty — not sorted)</td></tr>
+</table>
+
+<h3>Int64Vector — frame-of-reference encoding</h3>
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Encoding, per segment column</h3>
+    <p style="font-size:13px">The constructor takes the column's min as <code>base_</code> and stores
+    <code>value − base</code> in the narrowest unsigned width that holds the range (max − min):</p>
+    <table class="mem-table" style="font-size:11px">
+      <tr><th>range ≤</th><th>codes_ alternative</th><th>bytes/value</th></tr>
+      <tr><td>255</td><td>vector&lt;uint8_t&gt;</td><td>1</td></tr>
+      <tr><td>65,535</td><td>vector&lt;uint16_t&gt;</td><td>2</td></tr>
+      <tr><td>2³² − 1</td><td>vector&lt;uint32_t&gt;</td><td>4</td></tr>
+      <tr><td>otherwise</td><td>vector&lt;uint64_t&gt;</td><td>8</td></tr>
+    </table>
+    <p style="font-size:12px;color:var(--muted)">Each segment picks its own width, so one table column can mix widths across segments.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Reading: <code>visit()</code>, not <code>data()</code></h3>
+    <p style="font-size:13px">There is no <code>int64_t*</code> to borrow any more. Kernels call
+    <code>visit(f)</code>, which resolves the width once and hands <code>f</code> a typed
+    <code>std::span&lt;const uintN_t&gt;</code> plus the base. The inner loop is a plain widen-and-add:</p>
+<pre style="font-family:monospace;font-size:12px;color:var(--text);line-height:1.8">col.<span style="color:var(--green)">visit</span>([&amp;](<span style="color:var(--purple)">auto</span> codes, int64_t base) {
+    <span style="color:var(--purple)">for</span> (...)  v = Int64Vector::<span style="color:var(--green)">decode</span>(base, codes[i]);
+});</pre>
+    <p style="font-size:12px;color:var(--muted)"><code>value(i)</code> exists for cold paths; <code>raw()</code> returns <code>{codes, base, width}</code> for the compiled engine.</p>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Float64Vector — double or float</h3>
+    <p style="font-size:13px"><code>values_</code> is a <code>variant&lt;vector&lt;double&gt;, vector&lt;float&gt;&gt;</code>.
+    A schema column with <code>narrow_float = true</code> is stored as float (4 B). That is lossy in general and exact only
+    for inputs with at most 6 significant digits. Reads always widen to double; <code>visit()</code> hands kernels either span.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">What it buys on <code>readings</code></h3>
+    <p style="font-size:13px">10M rows, column bytes (<code>bench/results/baseline.txt</code> → <code>after-f64.txt</code> / <code>after-f32.txt</code>):</p>
+    <table class="mem-table" style="font-size:11px">
+      <tr><th>layout</th><th>total</th><th>per row</th></tr>
+      <tr><td>raw int64 / double</td><td>228.9 MiB</td><td>24.00 B</td></tr>
+      <tr><td>FOR ints, double value</td><td>125.4 MiB</td><td>13.15 B</td></tr>
+      <tr><td>FOR ints, float value</td><td>87.3 MiB</td><td>9.15 B</td></tr>
+    </table>
+    <p style="font-size:12px;color:var(--muted)">device_id takes 2 B per value; ts takes 2–4 B (4 B in segment 0; 30.1 MiB over 10M rows overall).</p>
+  </div>
+</div>
+
+<div class="callout yellow">
+  <strong>Immutability after seal()</strong>
+  Columns are built once, at <code>SegmentBuilder::seal()</code>, and have no append API. Until then the builder
+  buffers raw <code>int64_t</code> / <code>double</code> / <code>string</code> values; <code>seal()</code> sorts them
+  (if there is a sort key), builds the sparse index from the raw keys, then encodes each buffer into its immutable
+  <code>Vector</code>. The builder is exhausted and the <code>Segment</code> is const-only, so concurrent reads need no locking.
+  For a narrow-float column, <code>seal()</code> rebuilds the zone map from the stored floats: rounding can move a
+  value past the double min/max, and pruning must agree with what the filter will read.
+</div>
+
+<h3>SegmentBuilder → Segment lifecycle</h3>
+<div class="mermaid-wrap">
+<div class="mermaid">
+sequenceDiagram
+    participant C as Caller
+    participant SB as SegmentBuilder
+    participant S as Segment (immutable)
+
+    C->>SB: SegmentBuilder(schema)
+    Note over SB: one raw buffer per column<br/>vector of int64 / double / string<br/>plus an empty ZoneMap each
+
+    C->>SB: append_int64(0, 1)
+    Note over SB: push_back to buffers_[0]<br/>zones_[0].observe(1)<br/>num_rows_++ (col_idx==0)
+
+    C->>SB: append_int64(1, 1050)
+    Note over SB: push_back to buffers_[1]<br/>zones_[1].observe(1050)
+
+    C->>SB: append_float64(2, 5.1)
+    Note over SB: push_back to buffers_[2]<br/>zones_[2].observe(5.1)
+
+    Note over C,SB: ...repeat for rows 1,2,3...
+
+    C->>SB: seal(nullopt, 8192)
+    Note over SB: assert all buffers same length<br/>if sort key: sort all buffers in lockstep,<br/>index every 8192nd key
+    Note over SB: encode: Int64Vector (FOR base + codes)<br/>Float64Vector (double, or float if narrow_float)<br/>narrow float: rebuild its ZoneMap
+    SB-->>S: move columns, zones_, index → Segment
+    Note over S: builder exhausted, Segment frozen
+    SB-->>C: unique_ptr&lt;Segment&gt;
+</div>
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="zonemaps">
+<h2>Zone Maps — Segment Pruning</h2>
+<p class="section-subtitle">Query: <code>WHERE ts &gt; 1000</code>. Zone maps decide which segments to scan without reading any column data.</p>
+
+<h3>ts column range per segment</h3>
+<div class="card">
+  <div class="zone-row zone-prune">
+    <span class="zone-label">Segment 0</span>
+    <div class="zone-bar-wrap">
+      <div class="zone-bar" style="width:16%;background:rgba(248,81,73,.3);color:var(--red)">800–950</div>
+    </div>
+    <span class="zone-values" style="color:var(--red)">max=950 &lt; 1000 → PRUNED ✗</span>
+  </div>
+  <div class="zone-row">
+    <span class="zone-label">Segment 1</span>
+    <div class="zone-bar-wrap">
+      <div class="zone-bar" style="margin-left:26%;width:24%;background:rgba(86,211,100,.3);color:var(--green)">1020–1200</div>
+    </div>
+    <span class="zone-values" style="color:var(--green)">min=1020 &gt; 1000 → SCANNED ✓</span>
+  </div>
+  <div class="zone-row">
+    <span class="zone-label">Segment 2</span>
+    <div class="zone-bar-wrap">
+      <div class="zone-bar" style="margin-left:50%;width:26%;background:rgba(86,211,100,.3);color:var(--green)">1300–1450</div>
+    </div>
+    <span class="zone-values" style="color:var(--green)">min=1300 &gt; 1000 → SCANNED ✓</span>
+  </div>
+  <p style="margin-top:16px;font-size:13px;color:var(--muted)">
+    Segment 0 is skipped entirely — <code>zone_map_can_match(zm, Gt, 1000)</code> returns false because
+    <code>zmax (950) &lt;= value (1000)</code>. Zero rows read from it. Zone maps hold decoded values
+    (they are filled from the raw values before encoding), so pruning never looks at codes. Both engines prune
+    with the same check: the compiled engine's host calls <code>zone_map_can_match</code> on the same predicate
+    before it hands segments to generated code.
+  </p>
+</div>
+
+<h3>zone_map_can_match logic for ts &gt; 1000</h3>
+<table class="mem-table">
+  <tr><th>Segment</th><th>ts ZoneMap</th><th>Check: zmax &gt; 1000?</th><th>Result</th></tr>
+  <tr><td>0</td><td>min=800, max=950</td><td>950 &gt; 1000 → <span class="t-red" style="color:var(--red)">false</span></td><td style="color:var(--red)">PRUNE — skip</td></tr>
+  <tr><td>1</td><td>min=1020, max=1200</td><td>1200 &gt; 1000 → <span style="color:var(--green)">true</span></td><td style="color:var(--green)">SCAN</td></tr>
+  <tr><td>2</td><td>min=1300, max=1450</td><td>1450 &gt; 1000 → <span style="color:var(--green)">true</span></td><td style="color:var(--green)">SCAN</td></tr>
+</table>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="index">
+<h2>Primary Index (Sparse)</h2>
+<p class="section-subtitle">When a Table is sorted by a key column, each Segment gets a sparse index mapping granule start positions to their key values. Enables binary-search within a segment.</p>
+
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Without index</h3>
+    <p style="font-size:13px">Scan starts at row 0 and applies the filter predicate to every row. With 65,536-row segments, that's 65,536 comparisons per segment even if only 100 rows match.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">With sparse index (granule_size = 8192)</h3>
+    <p style="font-size:13px">The index has 8 entries for a 65,536-row segment. Binary search finds the first granule that could satisfy <code>ts &gt; cutoff</code>, and the scan starts there — skipping up to 57,000 rows without reading them.</p>
+  </div>
+</div>
+
+<h3>Example: 16-row segment sorted by ts, granule_size=4</h3>
+<div class="col-blocks">
+  <div class="col-block">
+    <div class="col-header int64">ts (sorted)</div>
+    <div class="col-cell" style="background:rgba(163,113,247,.1)">row 0 → <span class="t-int64">1010</span> <span class="t-idx">← granule 0</span></div>
+    <div class="col-cell">row 1 → <span class="t-int64">1050</span></div>
+    <div class="col-cell">row 2 → <span class="t-int64">1080</span></div>
+    <div class="col-cell">row 3 → <span class="t-int64">1090</span></div>
+    <div class="col-cell" style="background:rgba(163,113,247,.1)">row 4 → <span class="t-int64">1120</span> <span class="t-idx">← granule 1</span></div>
+    <div class="col-cell">row 5 → <span class="t-int64">1150</span></div>
+    <div class="col-cell">row 6 → <span class="t-int64">1180</span></div>
+    <div class="col-cell">row 7 → <span class="t-int64">1200</span></div>
+    <div class="col-cell" style="background:rgba(163,113,247,.1)">row 8 → <span class="t-int64">1250</span> <span class="t-idx">← granule 2</span></div>
+    <div class="col-cell">row 9 → <span class="t-int64">1300</span></div>
+    <div class="col-cell">row 10 → <span class="t-int64">1350</span></div>
+    <div class="col-cell">row 11 → <span class="t-int64">1400</span></div>
+  </div>
+  <div class="col-block" style="border-color:var(--purple)">
+    <div class="col-header" style="background:rgba(163,113,247,.15);color:var(--purple)">primary_index_</div>
+    <div class="col-cell"><span class="t-idx">{sort_key=1010, row_offset=0}</span></div>
+    <div class="col-cell"><span class="t-idx">{sort_key=1120, row_offset=4}</span></div>
+    <div class="col-cell"><span class="t-idx">{sort_key=1250, row_offset=8}</span></div>
+  </div>
+</div>
+
+<p>Query <code>ts &gt; 1130</code>: <code>scan_start_row()</code> runs <code>upper_bound</code> over the index for the first
+granule whose start key is greater than 1130 (granule 2, key 1250), then backs up one granule, because rows of the
+previous granule can still exceed 1130. Scan begins at row 4 (granule 1) and skips rows 0–3 entirely.</p>
+
+<p style="font-size:13px;color:var(--muted)">The skip is conservative and granule-sized: for <code>ts &gt; 1100</code> the same
+search lands on granule 0 (its start key 1010 ≤ 1100), so the scan starts at row 0 even though rows 0–3 cannot match; the
+filter discards them. <code>Lt</code>, <code>Le</code> and <code>Ne</code> always start at row 0. The index is only built
+for a table's sort key, and is used only when the scan predicate is on that column. <code>scan_start_row()</code> is shared by
+<code>ScanOperator</code> and the compiled engine's host, so both engines read identical row ranges.</p>
+
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="row-model">
+<h2>v1 — Row-at-a-Time (Volcano Model)</h2>
+<p class="section-subtitle">The first version of ScanOperator returned one <code>ScanRow</code> per <code>next()</code> call — the classic Volcano iterator. Simple, but one virtual call per row.</p>
+
+<h3>ScanRow — the original return type</h3>
+<div class="card">
+<pre style="font-family:monospace;font-size:13px;color:var(--text);line-height:1.8">
+<span style="color:var(--muted)">// operator.h (original)</span>
+<span style="color:var(--purple)">struct</span> <span style="color:var(--blue)">ScanRow</span> {
+    std::size_t segment_idx;   <span style="color:var(--muted)">// which segment</span>
+    std::size_t row_idx;       <span style="color:var(--muted)">// which row within that segment</span>
+};
+
+<span style="color:var(--purple)">class</span> <span style="color:var(--blue)">Operator</span> {
+    <span style="color:var(--purple)">virtual</span> std::optional&lt;<span style="color:var(--blue)">ScanRow</span>&gt; <span style="color:var(--green)">next</span>() = 0;
+};
+</pre>
+</div>
+
+<h3>How the caller used it</h3>
+<div class="card">
+<pre style="font-family:monospace;font-size:13px;color:var(--text);line-height:1.8">
+<span style="color:var(--muted)">// Counting rows — one virtual call per row</span>
+<span style="color:var(--blue)">ScanOperator</span> scan{t, std::nullopt};
+std::size_t count = 0;
+<span style="color:var(--purple)">while</span> (<span style="color:var(--purple)">auto</span> row = scan.<span style="color:var(--green)">next</span>())  <span style="color:var(--muted)">// returns ScanRow{seg=1, row=3}</span>
+    ++count;                          <span style="color:var(--muted)">// just counting — never reads column data</span>
+</pre>
+</div>
+
+<h3>What each ScanRow call returned — one row ID, no data</h3>
+<div class="batch-vis">
+  <div class="batch-box" style="min-width:160px">
+    <div class="label">next() call 0</div>
+    <div class="batch-field"><span class="key">segment_idx = </span><span class="val">1</span></div>
+    <div class="batch-field"><span class="key">row_idx     = </span><span class="val">0</span></div>
+    <div class="batch-field t-muted" style="font-size:11px;margin-top:4px">→ caller must<br/>lookup seg+row themselves</div>
+  </div>
+  <div class="batch-box" style="min-width:160px">
+    <div class="label">next() call 1</div>
+    <div class="batch-field"><span class="key">segment_idx = </span><span class="val">1</span></div>
+    <div class="batch-field"><span class="key">row_idx     = </span><span class="val">1</span></div>
+  </div>
+  <div class="batch-box" style="min-width:160px">
+    <div class="label">next() call 2</div>
+    <div class="batch-field"><span class="key">segment_idx = </span><span class="val">1</span></div>
+    <div class="batch-field"><span class="key">row_idx     = </span><span class="val">2</span></div>
+  </div>
+  <div class="batch-box" style="min-width:160px;border-style:dashed;border-color:var(--muted)">
+    <div class="label">next() call N</div>
+    <div class="batch-field t-muted" style="font-size:12px">...one call per row<br/>10M rows = 10M<br/>virtual calls</div>
+  </div>
+</div>
+
+<h3>The cost — 4 dispatches per row</h3>
+<div class="grid2">
+  <div class="card" style="border-color:var(--red)">
+    <h3 style="margin-top:0;color:var(--red)">Inside matches() — per row</h3>
+    <ol style="font-size:13px;padding-left:18px;line-height:2;color:var(--text)">
+      <li><code>std::visit</code> on predicate variant → type dispatch</li>
+      <li>Generic lambda instantiation</li>
+      <li><code>static_cast</code> to typed vector</li>
+      <li><code>switch(op)</code> for comparison</li>
+    </ol>
+    <p style="font-size:12px;color:var(--muted);margin-top:8px">All 4 steps are <em>constant for the entire batch</em> — the predicate never changes between rows. Yet we paid for them 10M times.</p>
+  </div>
+  <div class="card" style="border-color:var(--red)">
+    <h3 style="margin-top:0;color:var(--red)">The per-row matches() call</h3>
+    <pre style="font-family:monospace;font-size:12px;color:var(--text);line-height:1.8"><span style="color:var(--muted)">// Called once per row — brutal</span>
+<span style="color:var(--purple)">static bool</span> <span style="color:var(--green)">matches</span>(<span style="color:var(--purple)">const</span> <span style="color:var(--blue)">Vector</span>&amp; col,
+                     uint32_t row,
+                     <span style="color:var(--purple)">const</span> <span style="color:var(--blue)">Predicate</span>&amp; pred) {
+    <span style="color:var(--purple)">return</span> std::visit(          <span style="color:var(--muted)">// ← dispatch #1</span>
+        [&amp;](<span style="color:var(--purple)">const auto</span>&amp; pval) {
+            <span style="color:var(--purple)">if constexpr</span> (...)       <span style="color:var(--muted)">// ← dispatch #2</span>
+                <span style="color:var(--purple)">auto</span> v = cast(col)[row]; <span style="color:var(--muted)">// ← dispatch #3</span>
+                <span style="color:var(--purple)">switch</span>(pred.op) ...      <span style="color:var(--muted)">// ← dispatch #4</span>
+        }, pred.value);
+}</pre>
+  </div>
+</div>
+
+<h3>Evolution: Row → Batch</h3>
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph LR
+    V1["v1: ScanRow<br/>next() → ScanRow{seg,row}<br/>one row ID per call<br/>caller must lookup data<br/>N virtual calls for N rows"]
+    V2["v2: Batch<br/>next() → Batch{columns,offset,size,sel}<br/>up to 4096 rows per call<br/>columns and sel borrowed as spans<br/>~N/4096 virtual calls"]
+    Gain["Gains:<br/>• 4096× fewer virtual calls<br/>• dispatch once per batch<br/>• tight inner loop → SIMD<br/>• sel vector composable"]
+    V3["v3: compiled pipeline<br/>same plan, generated C++<br/>one fused loop per pipeline<br/>no next() in the hot path"]
+    V1 -->|"redesign"| V2
+    V2 --> Gain
+    V2 -->|"alternative engine"| V3
+
+    style V1 fill:#161b22,stroke:#f85149,color:#c9d1d9
+    style V2 fill:#161b22,stroke:#56d364,color:#c9d1d9
+    style V3 fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style Gain fill:#0d1117,stroke:#30363d,color:#c9d1d9
+</div>
+</div>
+
+<div class="callout yellow">
+  <strong>Why the row model was kept at all</strong>
+  <code>ScanRow</code> is conceptually clean for explaining execution — "give me the next row". The
+  Volcano model is in every textbook. We built it first to prove the pipeline works, then replaced
+  the return type with <code>Batch</code> to amortise call overhead. The operator interface
+  (<code>next()</code>, <code>nullopt</code> = done) stayed identical. <code>ScanRow</code> itself no longer exists in
+  <code>src/</code>; this section is history. The vectorized engine (v2) is what <code>main.cpp</code> and <code>wb_bench</code> run, and the compiled engine
+  (<a href="#compiled" style="color:var(--purple)">v3</a>) runs the same plans next to it.
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="batch">
+<h2>v2 — Batch Model (Vectorized)</h2>
+<p class="section-subtitle">A Batch is a non-owning window into a Segment. It never copies data and owns nothing: both the column list and the selection vector are <code>std::span</code>s borrowed from the operator that produced it. Same <code>next()</code> interface as v1, but 4096 rows per call instead of 1.</p>
+
+<h3>Batch emitted by ScanOperator from Segment 1 (all 4 rows, no filter yet)</h3>
+<div class="batch-vis">
+  <div class="batch-box">
+    <div class="label">Batch state</div>
+    <div class="batch-field"><span class="key">offset_  = </span><span class="val">0</span></div>
+    <div class="batch-field"><span class="key">size_    = </span><span class="val">4</span></div>
+    <div class="batch-field"><span class="key">has_sel_ = </span><span class="val">false</span> <span class="t-muted">(rows offset..offset+size live)</span></div>
+    <div class="batch-field"><span class="key">sel_     = </span><span class="val">{}</span> <span class="t-muted">(empty span)</span></div>
+    <div class="batch-field" style="margin-top:8px"><span class="key">columns_ = </span><span class="val">span → ScanOperator::batch_cols_</span></div>
+    <div class="batch-field"><span class="key">  [0] = </span><span class="val" style="color:var(--blue)">→ Int64Vector (device_id)</span></div>
+    <div class="batch-field"><span class="key">  [1] = </span><span class="val" style="color:var(--blue)">→ Int64Vector (ts)</span></div>
+    <div class="batch-field"><span class="key">  [2] = </span><span class="val" style="color:var(--green)">→ Float64Vector (value)</span></div>
+  </div>
+  <div style="display:flex;align-items:center;color:var(--muted);font-size:20px">→</div>
+  <div>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:8px">Live rows (all, since no sel vector):</p>
+    <div class="col-blocks" style="margin:0">
+      <div class="col-block">
+        <div class="col-header int64">device_id</div>
+        <div class="col-cell highlighted">row 0 → 1</div>
+        <div class="col-cell highlighted">row 1 → 2</div>
+        <div class="col-cell highlighted">row 2 → 3</div>
+        <div class="col-cell highlighted">row 3 → 3</div>
+      </div>
+      <div class="col-block">
+        <div class="col-header int64">ts</div>
+        <div class="col-cell highlighted">row 0 → 1050</div>
+        <div class="col-cell highlighted">row 1 → 1100</div>
+        <div class="col-cell highlighted">row 2 → 1020</div>
+        <div class="col-cell highlighted">row 3 → 1200</div>
+      </div>
+      <div class="col-block">
+        <div class="col-header f64">value</div>
+        <div class="col-cell highlighted">row 0 → 5.1</div>
+        <div class="col-cell highlighted">row 1 → 9.9</div>
+        <div class="col-cell highlighted">row 2 → 3.3</div>
+        <div class="col-cell highlighted">row 3 → 7.7</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>After FilterOperator applies <code>ts &gt; 1050</code></h3>
+<div class="batch-vis">
+  <div class="batch-box">
+    <div class="label">Batch state (after set_sel)</div>
+    <div class="batch-field"><span class="key">offset_  = </span><span class="val">0</span> <span class="t-muted">(ignored once has_sel_)</span></div>
+    <div class="batch-field"><span class="key">size_    = </span><span class="val">2</span></div>
+    <div class="batch-field"><span class="key">has_sel_ = </span><span class="val">true</span></div>
+    <div class="batch-field"><span class="key">sel_     = </span><span class="val">span → FilterOperator::survivors_buf_</span></div>
+    <div class="sel-vec">
+      <span class="sel-chip">1</span>
+      <span class="sel-chip">3</span>
+    </div>
+    <div class="batch-field t-muted" style="font-size:11px;margin-top:6px">rows 0 and 2 filtered out<br/>(ts=1050 not &gt; 1050, ts=1020 not &gt; 1050)<br/>sel entries are absolute row indices</div>
+  </div>
+  <div style="display:flex;align-items:center;color:var(--muted);font-size:20px">→</div>
+  <div>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:8px">Consumer iterates <code>batch.sel()</code> = {1, 3}, usually through <code>for_each_live_row(batch, f)</code>:</p>
+    <div class="col-blocks" style="margin:0">
+      <div class="col-block">
+        <div class="col-header int64">device_id</div>
+        <div class="col-cell filtered-out">row 0 → 1</div>
+        <div class="col-cell highlighted">row 1 → 2 ✓</div>
+        <div class="col-cell filtered-out">row 2 → 3</div>
+        <div class="col-cell highlighted">row 3 → 3 ✓</div>
+      </div>
+      <div class="col-block">
+        <div class="col-header int64">ts</div>
+        <div class="col-cell filtered-out">row 0 → 1050</div>
+        <div class="col-cell highlighted">row 1 → 1100 ✓</div>
+        <div class="col-cell filtered-out">row 2 → 1020</div>
+        <div class="col-cell highlighted">row 3 → 1200 ✓</div>
+      </div>
+      <div class="col-block">
+        <div class="col-header f64">value</div>
+        <div class="col-cell filtered-out">row 0 → 5.1</div>
+        <div class="col-cell highlighted">row 1 → 9.9 ✓</div>
+        <div class="col-cell filtered-out">row 2 → 3.3</div>
+        <div class="col-cell highlighted">row 3 → 7.7 ✓</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>The filter kernel — branchless, into a reused buffer</h3>
+<div class="grid2">
+  <div class="card">
+    <pre style="font-family:monospace;font-size:12px;color:var(--text);line-height:1.8"><span style="color:var(--muted)">// filter.cpp — select_rows(), no-sel case (the sel case loops over batch.sel())</span>
+<span style="color:var(--purple)">if</span> (out.size() &lt; batch.size()) out.resize(batch.size());
+std::uint32_t* dst = out.data();
+std::size_t    n   = 0;
+<span style="color:var(--purple)">for</span> (std::uint32_t i = offset; i &lt; end; ++i) {
+    dst[n] = i;        <span style="color:var(--muted)">// always store</span>
+    n += pred(i);      <span style="color:var(--muted)">// advance only on match</span>
+}</pre>
+  </div>
+  <div class="card">
+    <p style="font-size:13px"><code>FilterOperator</code> dispatches once per batch on column type × FOR width
+    (via <code>visit()</code>) × <code>CompareOp</code>. The row loop has no branch on the predicate, so a
+    50%-selective filter pays no mispredictions.</p>
+    <p style="font-size:13px"><code>survivors_buf_</code> grows to the largest batch and stays there; the emitted batch's
+    <code>sel_</code> borrows it. A batch with no survivors is skipped, and the filter pulls the next one.</p>
+  </div>
+</div>
+
+<div class="callout">
+  <strong>Zero-copy, zero-allocation design</strong>
+  The column data is never copied. <code>columns_</code> borrows <code>ScanOperator::batch_cols_</code>, which is rebuilt
+  once per segment, not per batch. <code>sel_</code> borrows <code>FilterOperator::survivors_buf_</code>. Building a batch
+  therefore allocates nothing. The price is a lifetime rule: a batch is valid only until the next <code>next()</code>
+  on the operator that produced it (or anything upstream), so operators must not keep batches across calls.
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="pipeline">
+<h2>Operator Pipeline</h2>
+<p class="section-subtitle">Operators are composable. Each wraps a child and transforms the stream of Batches. The caller drives everything by calling <code>next()</code> in a loop.</p>
+
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph LR
+    Table["🗄️ Table"] -->|"segments"| Scan
+    Scan["🔍 ScanOperator<br/>- zone-map prune<br/>- index seek<br/>- emit Batch"]
+    Scan -->|"Batch (all rows)"| Filter
+    Filter["⚡ FilterOperator<br/>- visit FOR width once/batch<br/>- branchless select<br/>- set sel vector"]
+    Filter -->|"Batch (survivors only)"| HashAgg
+    HashAgg["📊 HashAggOperator<br/>- consume: 2 passes per batch<br/>- make_output_: 1 column per agg<br/>- emit 4096-row slices"]
+    HashAgg -->|"Batch (one row per group)"| Caller
+    Caller["👤 Caller loop<br/>while(batch = agg.next())<br/>  consume batch"]
+
+    style Table fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style Scan fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Filter fill:#161b22,stroke:#56d364,color:#c9d1d9
+    style HashAgg fill:#161b22,stroke:#e3b341,color:#c9d1d9
+    style Caller fill:#161b22,stroke:#8b949e,color:#c9d1d9
+</div>
+</div>
+
+<p style="font-size:13px;color:var(--muted)">Operator trees can be built by hand (as <code>main.cpp</code> and <code>wb_bench</code> do) or
+lowered from the shared plan IR by <code>plan::run_vectorized()</code> (<code>src/plan/lower_vec.cpp</code>): a Filter directly
+over a Scan becomes a pruning <code>ScanOperator</code> on the first conjunct plus one <code>FilterOperator</code> per conjunct,
+a HashJoin becomes a <a href="#hashjoin" style="color:var(--purple)"><code>HashJoinOperator</code></a>, and the root Aggregate a
+<code>HashAggOperator</code>. The same plan also feeds the <a href="#compiled" style="color:var(--purple)">compiled engine</a>.</p>
+
+<h3>Pull-based execution — the call stack when caller requests one batch</h3>
+<div class="mermaid-wrap">
+<div class="mermaid">
+sequenceDiagram
+    participant Caller
+    participant HashAgg
+    participant Filter
+    participant Scan
+    participant Segment
+
+    Caller->>HashAgg: next()
+    Note over HashAgg: first call → build_() begins
+
+    loop until child exhausted
+        HashAgg->>Filter: child_->next()
+        Filter->>Scan: child_->next()
+        Scan->>Segment: new segment: borrow column ptrs into batch_cols_
+        Segment-->>Scan: pointers (no copy)
+        Scan-->>Filter: Batch{cols, offset=0, size=4, no sel}
+
+        Note over Filter: visit() resolves FOR width<br/>dispatch_op once on op<br/>branchless select_rows into survivors_buf_
+        Filter-->>HashAgg: Batch{cols, size=2, sel=[1,3]}
+
+        Note over HashAgg: reserve(size + 2)<br/>pass 1: find_or_insert(device_id) → ptrs_, ++count<br/>pass 2: SUM loop adds value into each state
+    end
+
+    Note over HashAgg: make_output_()<br/>walk gids in first-seen order → output columns
+
+    HashAgg-->>Caller: Batch{[key, sum, count], offset=0, size=4096}
+    Note over Caller,HashAgg: later next() calls return the rest of the groups in 4096-row slices
+</div>
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="e2e">
+<h2>End-to-End Example</h2>
+<p class="section-subtitle">
+  Query: <code>SELECT device_id, SUM(value), COUNT(*) FROM sensors WHERE ts &gt; 1000 GROUP BY device_id</code><br>
+  Table has 3 segments × 4 rows = 12 rows. We trace every step.
+  Operators: <code>ScanOperator(t, ts &gt; 1000)</code> → <code>FilterOperator(ts &gt; 1000)</code> →
+  <code>HashAggOperator(child, /*group*/0, /*sum*/2)</code>, whose convenience constructor means aggregates
+  <code>{SUM(value), COUNT(*)}</code>.
+</p>
+
+<div class="steps">
+
+<div class="step">
+<h4>Table loaded — 3 segments, columnar layout</h4>
+<div class="grid3">
+  <div class="card" style="border-color:var(--red)">
+    <div style="font-size:11px;color:var(--red);text-transform:uppercase;margin-bottom:8px">Segment 0</div>
+    <table class="mem-table" style="font-size:11px">
+      <tr><th>device_id</th><th>ts</th><th>value</th></tr>
+      <tr><td>1</td><td>800</td><td>10.5</td></tr>
+      <tr><td>1</td><td>900</td><td>20.3</td></tr>
+      <tr><td>2</td><td>850</td><td>15.0</td></tr>
+      <tr><td>2</td><td>950</td><td>8.7</td></tr>
+    </table>
+    <div style="font-size:11px;color:var(--red);margin-top:8px">ts zone: [800, 950]</div>
+  </div>
+  <div class="card" style="border-color:var(--green)">
+    <div style="font-size:11px;color:var(--green);text-transform:uppercase;margin-bottom:8px">Segment 1</div>
+    <table class="mem-table" style="font-size:11px">
+      <tr><th>device_id</th><th>ts</th><th>value</th></tr>
+      <tr><td>1</td><td>1050</td><td>5.1</td></tr>
+      <tr><td>2</td><td>1100</td><td>9.9</td></tr>
+      <tr><td>3</td><td>1020</td><td>3.3</td></tr>
+      <tr><td>3</td><td>1200</td><td>7.7</td></tr>
+    </table>
+    <div style="font-size:11px;color:var(--green);margin-top:8px">ts zone: [1020, 1200]</div>
+  </div>
+  <div class="card" style="border-color:var(--green)">
+    <div style="font-size:11px;color:var(--green);text-transform:uppercase;margin-bottom:8px">Segment 2</div>
+    <table class="mem-table" style="font-size:11px">
+      <tr><th>device_id</th><th>ts</th><th>value</th></tr>
+      <tr><td>2</td><td>1300</td><td>12.0</td></tr>
+      <tr><td>3</td><td>1400</td><td>6.5</td></tr>
+      <tr><td>1</td><td>1350</td><td>18.2</td></tr>
+      <tr><td>3</td><td>1450</td><td>4.4</td></tr>
+    </table>
+    <div style="font-size:11px;color:var(--green);margin-top:8px">ts zone: [1300, 1450]</div>
+  </div>
+</div>
+</div>
+
+<div class="step">
+<h4>ScanOperator: zone-map prune. Segment 0 skipped (max ts=950 ≤ 1000).</h4>
+<p style="font-size:13px;color:var(--muted)">Segments 1 and 2 survive. ScanOperator emits Batch from Segment 1:</p>
+<div class="batch-vis">
+  <div class="batch-box" style="border-color:var(--blue)">
+    <div class="label">Batch — Segment 1</div>
+    <div class="batch-field"><span class="key">offset=0  size=4  has_sel=false</span></div>
+    <div class="batch-field t-muted" style="font-size:11px">columns_ = span over batch_cols_:<br/>3 borrowed column pointers (FOR ts base 1020)</div>
+  </div>
+</div>
+</div>
+
+<div class="step">
+<h4>FilterOperator: apply ts &gt; 1000. One dispatch, branchless kernel loop.</h4>
+<p style="font-size:13px;color:var(--muted)"><code>visit()</code> hands the kernel ts's <code>uint8_t</code> codes and base 1020, so each row decodes as
+1020 + code: 1050&gt;1000✓, 1100✓, 1020✓, 1200✓ → all 4 survive for Segment 1. <code>survivors_buf_</code> = [0,1,2,3],
+and the batch's <code>sel_</code> borrows it.</p>
+<div class="batch-vis">
+  <div class="batch-box" style="border-color:var(--green)">
+    <div class="label">Batch — after filter (seg 1)</div>
+    <div class="batch-field"><span class="key">sel = </span></div>
+    <div class="sel-vec">
+      <span class="sel-chip">0</span><span class="sel-chip">1</span><span class="sel-chip">2</span><span class="sel-chip">3</span>
+    </div>
+    <div class="batch-field t-muted" style="font-size:11px;margin-top:4px">all 4 rows pass ts &gt; 1000</div>
+  </div>
+</div>
+</div>
+
+<div class="step">
+<h4>HashAgg consumes the Segment 1 batch: reserve, then pass 1, then pass 2.</h4>
+<p style="font-size:13px;color:var(--muted)"><code>slots_-&gt;reserve(size() + 4)</code> first, so the table cannot rehash mid-batch and every state
+pointer taken in pass 1 stays valid through pass 2. Each group's state block lives inline in its hash slot:
+<code>[count int64 | sum double]</code>.</p>
+<table class="mem-table">
+  <tr><th>pass 1 row</th><th>find_or_insert(device_id)</th><th>gid</th><th>ptrs_[k]</th><th>count after</th></tr>
+  <tr><td>row 0</td><td class="t-int64">1 → fresh, init_state_</td><td>0</td><td>state of 1</td><td>1</td></tr>
+  <tr><td>row 1</td><td class="t-int64">2 → fresh</td><td>1</td><td>state of 2</td><td>1</td></tr>
+  <tr><td>row 2</td><td class="t-int64">3 → fresh</td><td>2</td><td>state of 3</td><td>1</td></tr>
+  <tr><td>row 3</td><td class="t-int64">3 → hit</td><td>2</td><td>state of 3</td><td>2</td></tr>
+</table>
+<table class="mem-table">
+  <tr><th>pass 2 (SUM loop)</th><th>ptrs_[k]→sum += value</th><th>sum after</th></tr>
+  <tr><td>k=0</td><td>device 1 += 5.1</td><td>5.1</td></tr>
+  <tr><td>k=1</td><td>device 2 += 9.9</td><td>9.9</td></tr>
+  <tr><td>k=2</td><td>device 3 += 3.3</td><td>3.3</td></tr>
+  <tr><td>k=3</td><td>device 3 += 7.7</td><td>11.0</td></tr>
+</table>
+</div>
+
+<div class="step">
+<h4>ScanOperator emits Segment 2. All rows pass filter (all ts &gt; 1000). HashAgg runs the same two passes.</h4>
+<table class="mem-table">
+  <tr><th>device_id</th><th>ts</th><th>value</th><th>group state after both passes</th></tr>
+  <tr><td>2</td><td>1300</td><td>12.0</td><td>device_id 2 (gid 1): sum=21.9, count=2</td></tr>
+  <tr><td>3</td><td>1400</td><td>6.5</td><td>device_id 3 (gid 2): sum=17.5, count=3</td></tr>
+  <tr><td>1</td><td>1350</td><td>18.2</td><td>device_id 1 (gid 0): sum=23.3, count=2</td></tr>
+  <tr><td>3</td><td>1450</td><td>4.4</td><td>device_id 3 (gid 2): sum=21.9, count=4</td></tr>
+</table>
+<p style="font-size:13px;color:var(--muted)">No new groups, so gids keep their first-seen numbering from Segment 1.</p>
+</div>
+
+<div class="step">
+<h4>Child exhausted. make_output_(): walk gids 0, 1, 2 → one output column per aggregate.</h4>
+<div class="col-blocks">
+  <div class="col-block" style="border-color:var(--blue)">
+    <div class="col-header int64">out_vecs_[0] (device_id)</div>
+    <div class="col-cell highlighted">row 0 → 1</div>
+    <div class="col-cell highlighted">row 1 → 2</div>
+    <div class="col-cell highlighted">row 2 → 3</div>
+  </div>
+  <div class="col-block" style="border-color:var(--green)">
+    <div class="col-header f64">out_vecs_[1] (SUM value)</div>
+    <div class="col-cell highlighted">row 0 → 23.3</div>
+    <div class="col-cell highlighted">row 1 → 21.9</div>
+    <div class="col-cell highlighted">row 2 → 21.9</div>
+  </div>
+  <div class="col-block" style="border-color:var(--blue)">
+    <div class="col-header int64">out_vecs_[2] (COUNT)</div>
+    <div class="col-cell highlighted">row 0 → 2</div>
+    <div class="col-cell highlighted">row 1 → 2</div>
+    <div class="col-cell highlighted">row 2 → 4</div>
+  </div>
+</div>
+</div>
+
+<div class="step">
+<h4>Caller receives output Batch. Final result.</h4>
+<div class="batch-vis">
+  <div class="batch-box" style="border-color:var(--yellow)">
+    <div class="label">Output Batch</div>
+    <div class="batch-field"><span class="key">offset=0  size=3  has_sel=false</span></div>
+    <div class="batch-field t-muted" style="font-size:11px">columns_ = span over out_cols_<br/>col 0 = device_id, col 1 = sum, col 2 = count<br/>rows in first-seen group order</div>
+  </div>
+  <div style="display:flex;align-items:center;color:var(--muted);font-size:20px">→</div>
+  <div class="card" style="border-color:var(--yellow);margin:0">
+    <table class="mem-table" style="margin:0">
+      <tr><th>device_id</th><th>SUM(value)</th><th>COUNT(*)</th></tr>
+      <tr><td class="t-int64">1</td><td class="t-f64">23.3</td><td class="t-int64">2</td></tr>
+      <tr><td class="t-int64">2</td><td class="t-f64">21.9</td><td class="t-int64">2</td></tr>
+      <tr><td class="t-int64">3</td><td class="t-f64">21.9</td><td class="t-int64">4</td></tr>
+    </table>
+  </div>
+</div>
+</div>
+
+</div><!-- end steps -->
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="hashagg">
+<h2>HashAgg — Inline State, Two Passes per Batch</h2>
+<p class="section-subtitle">Unlike Scan and Filter (streaming, one batch at a time), HashAgg blocks: it must consume ALL input before emitting any output. It computes any list of COUNT, SUM, MIN, MAX, AVG and MEDIAN, optionally grouped by one int64 column, with each group's state stored inline in its hash slot (<code>GroupSlots</code>).</p>
+
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph LR
+    subgraph BUILD["build_() — per input batch (blocking)"]
+        B1["child_->next()<br/>Batch with or without sel"] --> B2["slots_->reserve(size + rows)<br/>no rehash during this batch"]
+        B2 --> B3["Pass 1, over group key:<br/>state = find_or_insert(key, fresh)<br/>fresh: init_state_<br/>++count, ptrs_[k] = state"]
+        B3 --> B4["Pass 2, one loop per aggregate:<br/>SUM/AVG: += v<br/>MIN/MAX: update_min / update_max<br/>MEDIAN: store.append(handle, v)"]
+        B4 -->|"next batch"| B1
+    end
+
+    subgraph EMIT["make_output_() then next()"]
+        E1["walk gid 0..n-1<br/>first-seen order"] --> E2["one output column per aggregate<br/>MEDIAN: select per group<br/>SUM int64: overflow check"]
+        E2 --> E3["next() slices emit_cursor_<br/>by emit_batch_size_ (4096)"]
+    end
+
+    BUILD -->|"child exhausted"| EMIT
+
+    style BUILD fill:#0d1117,stroke:#79c0ff,color:#c9d1d9
+    style EMIT fill:#0d1117,stroke:#e3b341,color:#c9d1d9
+</div>
+</div>
+
+<p style="font-size:13px;color:var(--muted)">Each pass resolves the column's encoding once (<code>visit()</code>) and is templated on the batch's live
+rows, a contiguous range or the selection vector, so no row-id array is materialized. A global aggregate (no group column) skips
+pass 1: it keeps one state block and accumulates each aggregate in a local for the whole batch.</p>
+
+<h3>GroupSlots — one slot per group, state inline</h3>
+<div class="col-blocks">
+  <div class="col-block" style="border-color:var(--purple)">
+    <div class="col-header" style="background:rgba(163,113,247,.15);color:var(--purple)">slot header (16 B)</div>
+    <div class="col-cell"><span class="t-int64">key</span> int64</div>
+    <div class="col-cell"><span class="t-idx">gid</span> uint32 (dense, first-seen)</div>
+    <div class="col-cell t-muted">padding</div>
+  </div>
+  <div class="col-block" style="border-color:var(--yellow)">
+    <div class="col-header" style="background:rgba(227,179,65,.15);color:var(--yellow)">state block (rounded to 16 B)</div>
+    <div class="col-cell">__int128 sums (SUM/AVG of int64), 16-aligned</div>
+    <div class="col-cell">count int64 (always present)</div>
+    <div class="col-cell">8 B fields: double sums, MIN, MAX</div>
+    <div class="col-cell">MedianHandle {head, tail, count}</div>
+  </div>
+  <div class="col-block">
+    <div class="col-header" style="background:#21262d;color:var(--muted)">side arrays</div>
+    <div class="col-cell"><code>keys_</code>: gid → key</div>
+    <div class="col-cell"><code>slot_of_</code>: gid → slot</div>
+    <div class="col-cell t-muted" style="font-size:11px">INT64_MIN marks empty slots,<br/>so that key's state lives aside</div>
+  </div>
+</div>
+<p style="font-size:13px;color:var(--muted)">Multiplicative hash (<code>key × 0x9E3779B97F4A7C15</code>, low bits), linear probing, power-of-two capacity
+starting at 1024, doubling when groups × 2 reach capacity (load ≤ 0.5). Growing moves key, gid and state together; that is why
+<code>reserve()</code> runs before pass 1. The compiled engine's <code>wb_rt::GroupRows&lt;Row&gt;</code> uses the same algorithm.</p>
+
+<h3>Aggregate semantics (shared with the compiled engine)</h3>
+<table class="mem-table">
+  <tr><th>Aggregate</th><th>State</th><th>Update</th><th>Output</th></tr>
+  <tr><td>COUNT(*)</td><td>the shared count</td><td>pass 1: ++count</td><td class="t-int64">INT64</td></tr>
+  <tr><td>SUM</td><td>double, or __int128 for int64</td><td>starts at +0.0 / 0, every row adds</td><td>input type; int64 throws <code>overflow_error</code> if out of range</td></tr>
+  <tr><td>MIN / MAX</td><td>input type</td><td>starts at group's first value; <code>v &lt; m || v != v</code> (NaN wins)</td><td>input type</td></tr>
+  <tr><td>AVG</td><td>a SUM field</td><td>as SUM</td><td class="t-f64">FLOAT64 = sum / count</td></tr>
+  <tr><td>MEDIAN</td><td>MedianHandle + MedianStore</td><td>append to the group's block chain</td><td class="t-f64">FLOAT64, exact</td></tr>
+</table>
+
+<h3>MEDIAN — block chains, select at the end</h3>
+<div class="grid2">
+  <div class="card">
+    <p style="font-size:13px"><code>MedianStore&lt;T&gt;</code> keeps values in the column's storage type (int64, double, or float for a
+    narrow column). Each group owns a chain of <strong>2 KiB blocks</strong> (256 int64/double or 512 float), carved from 64-block,
+    128 KiB chunks that never move: no doubling, no copy on growth. Block next/size headers live in side arrays.</p>
+  </div>
+  <div class="card">
+    <p style="font-size:13px">At output, grouped MEDIAN copies each chain into a reused scratch array and runs
+    <code>std::nth_element</code> under <code>median_less</code> (−0.0 before +0.0, NaNs last by bit pattern). A global MEDIAN
+    selects in place over its consecutive blocks with an introselect that falls back to heapsort, so the worst case is O(n log n).</p>
+  </div>
+</div>
+<div class="callout green">
+  <strong>What inline state and block chains bought</strong>
+  From <code>docs/superpowers/specs/2026-10-21-footprint-fixes-design.md</code> §7 (10M rows, Apple M3 Pro): Q7 MEDIAN-by-group peak memory
+  fell from 382.9 to 89.0 MiB in the vectorized engine. Inline state did <em>not</em> speed up this operator's grouped SUM/COUNT
+  (Q4 vec 26.8 → 28.8 ms): per-aggregate passes read better from a dense state array than from state spread over a slot table.
+  It did help the compiled engine's fused loop (Q4 25.4 → 12.4 ms).
+</div>
+
+<h3>Parallel GROUP BY SUM/COUNT — worker model</h3>
+<p style="font-size:13px;color:var(--muted)">A separate, older path: <code>parallel_group_sum_count()</code> (<code>src/exec/parallel_agg.cpp</code>) does SUM/COUNT
+only, straight over segments, into flat <code>AggHashTable</code>s (key → {sum, count}, pre-sized to 32,768 slots). It does not use
+<code>HashAggOperator</code> or <code>GroupSlots</code>.</p>
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph TD
+    Table --> Counter["atomic&lt;size_t&gt; next_seg = 0"]
+    Counter --> W0["Thread 0<br/>claim seg 0 → fetch_add → 0<br/>local_ht[0] += rows"]
+    Counter --> W1["Thread 1<br/>claim seg 1 → fetch_add → 1<br/>local_ht[1] += rows"]
+    Counter --> W2["Thread 2<br/>claim seg 2 → fetch_add → 2<br/>local_ht[2] += rows"]
+    Counter --> WN["...11 workers total..."]
+    W0 --> Merge
+    W1 --> Merge
+    W2 --> Merge
+    WN --> Merge
+    Merge["Merge phase:<br/>locals[1..N].for_each → insert into locals[0]"]
+    Merge --> Result["locals[0] = global result"]
+
+    style Table fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style Counter fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Merge fill:#161b22,stroke:#e3b341,color:#c9d1d9
+    style Result fill:#161b22,stroke:#56d364,color:#c9d1d9
+    style W0 fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style W1 fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style W2 fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style WN fill:#0d1117,stroke:#30363d,color:#c9d1d9
+</div>
+</div>
+<div class="callout green">
+  <strong>No locks in the hot path</strong>
+  Each worker owns its own local <code>AggHashTable</code>. Workers never share state during the build phase —
+  the only shared variable is the atomic segment counter. Merge phase is single-threaded (N×10K lookups = fast).
+  In <code>bench/results/after-footprint.txt</code> (10M rows) this path takes 4.1 ms with 11 workers, against 28.4 ms for the
+  single-threaded <code>HashAggOperator</code> ("groupby device 1T"); the two differ in implementation as well as thread count.
+  The merged sum varies in its last digits between runs, because merge order depends on thread scheduling.
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="hashjoin">
+<h2>HashJoin — Sorted Build, Reused Output</h2>
+<p class="section-subtitle"><code>HashJoinOperator</code> (<code>src/exec/hash_join.*</code>): inner equi-join on one int64 key. The build side blocks on the first <code>next()</code>; the probe side streams. Output columns are every probe column, then every build column; duplicate keys on either side produce the full cross product per key.</p>
+
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph TD
+    subgraph BUILD["build_index_() — first next(), blocking"]
+        J1["drain build child<br/>copy live rows into one ChunkBuilder"] --> J2["seal → unsorted chunk<br/>decode every key"]
+        J2 --> J3["stable_sort row ids by key<br/>append_rows → sorted chunk build_rows_"]
+        J3 --> J4["one Bucket per run of equal keys<br/>(key, first, count), 16 B each<br/>capacity = bit_ceil(2 × distinct)"]
+    end
+
+    subgraph PROBE["next() — streaming"]
+        P1["load_probe_batch_()<br/>live rows + decoded keys"] --> P2["find_(key)<br/>hash top bits, linear probe"]
+        P2 --> P3["pairs (probe row, first + i)<br/>up to kOutputRows = 4096"]
+        P3 --> P4["gather_ into operator-owned out_vecs_<br/>reset_plain / reset keep capacity"]
+        P4 --> P5["Batch: probe columns, then build columns"]
+    end
+
+    BUILD --> PROBE
+
+    style BUILD fill:#0d1117,stroke:#79c0ff,color:#c9d1d9
+    style PROBE fill:#0d1117,stroke:#e3b341,color:#c9d1d9
+</div>
+</div>
+
+<h3>Example: build keys [7, 3, 7, 5]</h3>
+<div class="col-blocks">
+  <div class="col-block">
+    <div class="col-header int64">build_rows_ key (sorted)</div>
+    <div class="col-cell">row 0 → <span class="t-int64">3</span></div>
+    <div class="col-cell">row 1 → <span class="t-int64">5</span></div>
+    <div class="col-cell">row 2 → <span class="t-int64">7</span> <span class="t-muted">(was row 0)</span></div>
+    <div class="col-cell">row 3 → <span class="t-int64">7</span> <span class="t-muted">(was row 2)</span></div>
+  </div>
+  <div class="col-block" style="border-color:var(--purple)">
+    <div class="col-header" style="background:rgba(163,113,247,.15);color:var(--purple)">buckets_ (8 slots)</div>
+    <div class="col-cell"><span class="t-idx">{key=3, first=0, count=1}</span></div>
+    <div class="col-cell"><span class="t-idx">{key=5, first=1, count=1}</span></div>
+    <div class="col-cell"><span class="t-idx">{key=7, first=2, count=2}</span></div>
+    <div class="col-cell t-muted" style="font-size:11px">count = 0 marks an empty bucket</div>
+  </div>
+</div>
+<p>A probe row with key 7 finds one bucket and emits build rows 2 and 3 — they are contiguous because the build chunk is sorted.
+<code>stable_sort</code> keeps equal keys in their arrival order. Bucket positions come from the top bits of the multiplicative
+hash, since its low bits depend only on the key's low bits.</p>
+
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Output never spans two probe batches</h3>
+    <p style="font-size:13px">Pulling the next probe batch invalidates the current one, so <code>next()</code> emits what it has
+    before calling <code>load_probe_batch_()</code> again. A key with more matches than fit is continued on the next call
+    (<code>match_pos_</code>).</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Reused output columns</h3>
+    <p style="font-size:13px">For Int64/Float64 joins the operator owns one output <code>Vector</code> per column and refills it in place
+    every call: <code>Int64Vector::reset_plain(n)</code> (width 8, base 0) and <code>Float64Vector::reset(n)</code> keep capacity, so
+    steady-state batches allocate nothing. A join with a String column falls back to sealing a fresh chunk per batch.</p>
+  </div>
+</div>
+<div class="callout green">
+  <strong>Effect</strong>
+  From <code>2026-10-21-footprint-fixes-design.md</code> §7: reusing output columns took Q5 (join + group by region, 2M orders × 100k
+  customers) from 21.8 to 11.5 ms in the vectorized engine, and allocations per run from ~31,000 to 301. The per-batch output
+  allocations are gone; what remains is fixed per-query setup.
+</div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="compiled">
+<h2>v3 — Compiled Pipelines</h2>
+<p class="section-subtitle">A HyPer-style second engine. The same logical plan is turned into C++ with one fused loop per pipeline, compiled with clang into a shared library, loaded with <code>dlopen</code> and cached. Results match the vectorized engine bit for bit.</p>
+
+<div class="mermaid-wrap">
+<div class="mermaid">
+graph LR
+    Plan["plan::Node tree<br/>Scan, Filter, HashJoin, Aggregate<br/>src/plan/plan.h"]
+    Plan --> Lower["run_vectorized()<br/>lower_vec.cpp"]
+    Lower --> Ops["Operator tree<br/>v2 engine"]
+    Ops --> Res["QueryResult<br/>canonicalized"]
+    Plan --> Bind["bind_scans()<br/>width signatures,<br/>prune predicate"]
+    Bind --> Gen["generate()<br/>produce / consume"]
+    Gen --> Comp["compile_source()<br/>memory cache, then disk cache,<br/>else clang++ -O3 -march=native"]
+    Comp --> Load["dlopen + dlsym<br/>wb_abi_version must be 4"]
+    Load --> Exec["execute()<br/>host prunes segments,<br/>binds SegmentRefs, calls wb_query"]
+    Exec --> Res
+
+    style Plan fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style Lower fill:#161b22,stroke:#56d364,color:#c9d1d9
+    style Ops fill:#161b22,stroke:#56d364,color:#c9d1d9
+    style Bind fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Gen fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Comp fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Load fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Exec fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style Res fill:#161b22,stroke:#e3b341,color:#c9d1d9
+</div>
+</div>
+
+<div class="grid3">
+  <div class="card">
+    <h3 style="margin-top:0">Plan IR</h3>
+    <p style="font-size:13px"><code>Scan</code>, <code>Filter</code> (AND of compares), <code>HashJoin</code> on int64 keys, and an
+    <code>Aggregate</code> allowed only at the root. Column references are positions in the child's output.
+    <code>validate_query()</code> type-checks the tree before either engine sees it.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Compiler and cache</h3>
+    <p style="font-size:13px">The cache key is FNV-1a over the source, compiler path, flags and the contents of <code>runtime.h</code>.
+    Libraries live in <code>.wb_cache/</code> (<code>$WB_CODEGEN_CACHE</code>), the compiler is <code>$WB_CXX</code> (default
+    <code>clang++</code>), and loaded libraries stay loaded for the life of the process.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">runtime.h (ABI 4)</h3>
+    <p style="font-size:13px">Compiled into every library and included by the host. No STL, only <code>&lt;cstdint&gt;</code> /
+    <code>&lt;cstddef&gt;</code>, so a query compiles fast. It defines the ABI structs, <code>GroupRows&lt;Row&gt;</code> (rows inline in
+    hash slots), <code>MedianStore</code> and <code>JoinTable</code>, each mirroring the vectorized engine's algorithm.</p>
+  </div>
+</div>
+
+<h3>Produce / consume: one fused loop per pipeline</h3>
+<p><code>src/codegen/generator.cpp</code> walks the plan top-down. <code>produce()</code> on a Scan opens a new pipeline function with a
+row loop; every operator above it <em>consumes</em> by appending code into that loop's body. A Filter adds
+<code>if (!(…)) continue;</code> per conjunct, an Aggregate adds the group lookup and per-row updates. A HashJoin is a pipeline
+breaker: its build side becomes its own pipeline that appends rows to a <code>JoinTable</code> (finalized once the pipeline
+finishes: stable sort, then one <code>(key, first, count)</code> bucket per key), and the probe side loops over each tuple's matches inline.</p>
+
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Specialized per FOR width signature</h3>
+    <p style="font-size:13px">A segment's <em>width signature</em> packs the code width of each Int64 column the scan reads (2 bits each).
+    Each pipeline's segment function is a template on its code types, instantiated once per signature present in the table, and
+    a <code>switch (seg.width_sig)</code> dispatches every segment. A signature the library was not compiled for returns an error.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Lazy column loads</h3>
+    <p style="font-size:13px">A column is decoded at its first use, in whatever scope the code is in then (HyPer's "load attributes when
+    first touched"). After a filter, later columns are only read for surviving rows. The catch: a load placed after a branch cannot
+    be hoisted above it, which matters for Q3 below.</p>
+  </div>
+</div>
+
+<h3>Q4 side by side: <code>SELECT device_id, SUM(value), COUNT(*) FROM readings GROUP BY device_id</code></h3>
+<p style="font-size:13px;color:var(--muted)"><code>q4 = sum_count(scan(readings, {0, 2}), 0, 1)</code> in <code>src/tools/codegen_bench.cpp</code>.</p>
+<div class="grid2">
+  <div class="mermaid-wrap">
+  <div class="mermaid">
+graph TD
+    VS["ScanOperator<br/>cols device_id, value<br/>no predicate"]
+    VS -->|"Batch, 4096 rows"| VA["HashAggOperator<br/>group col 0: SUM(1), COUNT<br/>pass 1 + pass 2 per batch"]
+    VA -->|"Batch per 4096 groups"| VD["run_vectorized()<br/>drain into QueryResult"]
+
+    style VS fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style VA fill:#161b22,stroke:#e3b341,color:#c9d1d9
+    style VD fill:#161b22,stroke:#8b949e,color:#c9d1d9
+  </div>
+  </div>
+  <div class="mermaid-wrap">
+  <div class="mermaid">
+graph TD
+    CP["p0(): for each segment<br/>switch on width_sig"]
+    CP --> CS["p0_seg instantiated<br/>for device_id code type"]
+    CS --> CR["for i in seg.lo .. seg.hi"]
+    CR --> CL["v0 = value f1 at i<br/>v1 = b0 + code c0 at i"]
+    CL --> CG["e = st.groups.find_or_insert(v1)<br/>Row inline in its slot"]
+    CG --> CU["++e.count<br/>e.s0 += v0"]
+    CU -->|"next row"| CR
+
+    style CP fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style CS fill:#161b22,stroke:#a371f7,color:#c9d1d9
+    style CR fill:#161b22,stroke:#79c0ff,color:#c9d1d9
+    style CL fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style CG fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style CU fill:#0d1117,stroke:#30363d,color:#c9d1d9
+  </div>
+  </div>
+</div>
+
+<h3>Generated pipeline for Q4 (abridged)</h3>
+<div class="card">
+<pre style="font-family:monospace;font-size:12px;color:var(--text);line-height:1.8"><span style="color:var(--purple)">struct</span> <span style="color:var(--blue)">Row</span> { int64_t count; <span style="color:var(--purple)">double</span> s0; };
+
+<span style="color:var(--purple)">template</span> &lt;<span style="color:var(--purple)">class</span> C0&gt;
+<span style="color:var(--purple)">void</span> <span style="color:var(--green)">p0_seg</span>(<span style="color:var(--purple)">const</span> wb_rt::SegmentRef&amp; seg, State&amp; st) {
+    <span style="color:var(--purple)">const</span> C0* c0 = <span style="color:var(--purple)">static_cast</span>&lt;<span style="color:var(--purple)">const</span> C0*&gt;(seg.cols[0].data);      <span style="color:var(--muted)">// device_id codes</span>
+    <span style="color:var(--purple)">const</span> uint64_t b0 = <span style="color:var(--purple)">static_cast</span>&lt;uint64_t&gt;(seg.cols[0].base);   <span style="color:var(--muted)">// FOR base</span>
+    <span style="color:var(--purple)">const double</span>* f1 = <span style="color:var(--purple)">static_cast</span>&lt;<span style="color:var(--purple)">const double</span>*&gt;(seg.cols[1].data);
+    <span style="color:var(--purple)">for</span> (uint32_t i = seg.lo; i &lt; seg.hi; ++i) {
+        <span style="color:var(--purple)">const double</span> v0 = <span style="color:var(--purple)">static_cast</span>&lt;<span style="color:var(--purple)">double</span>&gt;(f1[i]);
+        <span style="color:var(--purple)">const</span> int64_t v1 = <span style="color:var(--purple)">static_cast</span>&lt;int64_t&gt;(b0 + <span style="color:var(--purple)">static_cast</span>&lt;uint64_t&gt;(c0[i]));
+        {
+            <span style="color:var(--purple)">bool</span> fresh = <span style="color:var(--purple)">false</span>;
+            Row&amp; e = *st.groups.<span style="color:var(--green)">find_or_insert</span>(v1, fresh);
+            <span style="color:var(--purple)">if</span> (fresh) e = Row{0, 0};
+            ++e.count;
+            e.s0 += v0;
+        }
+    }
+}
+
+<span style="color:var(--purple)">int</span> <span style="color:var(--green)">p0</span>(<span style="color:var(--purple)">const</span> wb_rt::ScanInput&amp; in, State&amp; st) {
+    <span style="color:var(--purple)">for</span> (uint32_t s = 0; s &lt; in.num_segs; ++s) {
+        <span style="color:var(--purple)">const</span> wb_rt::SegmentRef&amp; seg = in.segs[s];
+        <span style="color:var(--purple)">switch</span> (seg.width_sig) {
+        <span style="color:var(--purple)">case</span> 1u: p0_seg&lt;uint16_t&gt;(seg, st); <span style="color:var(--purple)">break</span>;   <span style="color:var(--muted)">// device_id in 2 B; one case per signature in the table</span>
+        <span style="color:var(--purple)">default</span>: <span style="color:var(--purple)">return</span> 1;
+        }
+    }
+    <span style="color:var(--purple)">return</span> 0;
+}</pre>
+<p style="font-size:12px;color:var(--muted);margin-top:8px">After the pipelines, <code>wb_query</code> walks <code>st.groups</code> in first-seen gid order and hands each
+group to the host as one row of 64-bit patterns through <code>QueryOutput::emit_row</code>. A global aggregate instead keeps one
+<code>Row acc</code> in a local per segment, continuing from <code>st.acc</code>, so its summation order is exactly the vectorized engine's.</p>
+</div>
+
+<h3>Headline comparison (single-threaded, best of 7, Apple M3 Pro)</h3>
+<table class="mem-table">
+  <tr><th>Query</th><th>vec ms</th><th>cg-O3 ms</th><th>cg speedup</th><th>Source</th></tr>
+  <tr><td>Q2 value &gt; 50 (global SUM/COUNT)</td><td>6.8</td><td>13.7</td><td style="color:var(--red)">0.49×</td><td class="t-muted">codegen spec §11</td></tr>
+  <tr><td>Q3 value &gt; 50 AND device_id &lt; 5000</td><td>7.2</td><td>35.3</td><td style="color:var(--red)">0.20×</td><td class="t-muted">codegen spec §11</td></tr>
+  <tr><td>Q4 group by device_id (SUM, COUNT)</td><td>28.8</td><td>12.4</td><td style="color:var(--green)">2.33×</td><td class="t-muted">footprint spec §7</td></tr>
+  <tr><td>Q6 group by: MIN, MAX, AVG, COUNT</td><td>41.3</td><td>20.6</td><td style="color:var(--green)">2.00×</td><td class="t-muted">footprint spec §7</td></tr>
+  <tr><td>Q5 join + group by region</td><td>11.5</td><td>12.4</td><td>0.93×</td><td class="t-muted">footprint spec §7</td></tr>
+  <tr><td>Q9 join + AVG/MEDIAN by region</td><td>23.0</td><td>26.2</td><td>0.88×</td><td class="t-muted">footprint spec §7</td></tr>
+</table>
+<p style="font-size:12px;color:var(--muted)">Sources: <code>docs/superpowers/specs/2026-10-21-codegen-vs-vectorized-design.md</code> §11 and
+<code>2026-10-21-footprint-fixes-design.md</code> §7 (raw output in <code>bench/results/codegen.txt</code> and <code>after-footprint.txt</code>).
+10M-row readings, 2M orders, 100k customers. The two specs are separate runs; the footprint spec's numbers are the later ones and
+replace §11 for Q4 and Q5.</p>
+
+<div class="grid3">
+  <div class="card" style="border-color:var(--green)">
+    <h3 style="margin-top:0;color:var(--green)">Grouped aggregation: compiled ≈ 2×</h3>
+    <p style="font-size:13px">With state inline in the slot, the fused per-row update touches one cache line per row. The vectorized
+    engine's per-aggregate passes cannot exploit that layout. (Before inline state, Q4 was a tie.)</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Joins: about even</h3>
+    <p style="font-size:13px">The compiled engine's earlier 1.86× on Q5 was mostly the vectorized join's per-batch output
+    materialization, not the execution model. With reused output columns the vectorized join is as fast or faster.</p>
+  </div>
+  <div class="card" style="border-color:var(--red)">
+    <h3 style="margin-top:0;color:var(--red)">Selective filters: vectorized wins</h3>
+    <p style="font-size:13px">Q2: clang if-converts the generated branch, so all 10M rows run a dependent <code>fadd</code>. Q3: lazy loading
+    puts <code>device_id</code>'s load after an unpredictable branch, so the loop cannot be if-converted. Branchless selection vectors win both.</p>
+  </div>
+</div>
+
+<div class="callout yellow">
+  <strong>One-off cost per cold query</strong>
+  Generating takes under 0.1 ms, compiling 45–93 ms, and loading 155–230 ms: the first <code>dlopen</code> of a newly written
+  <code>.dylib</code> costs more than compiling it, while re-opening a cached file in a later process takes 0.25–0.87 ms
+  (codegen spec §11). For the filter queries Q2 and Q3 the compiled engine never repays that cost.
+</div>
+</section>
+
+</div><!-- page -->
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    background: '#0d1117',
+    primaryColor: '#161b22',
+    primaryTextColor: '#c9d1d9',
+    primaryBorderColor: '#30363d',
+    lineColor: '#8b949e',
+    secondaryColor: '#21262d',
+    tertiaryColor: '#0d1117',
+    edgeLabelBackground: '#161b22',
+    nodeTextColor: '#c9d1d9',
+  }
+});
+
+// Nav highlight on scroll
+const sections = document.querySelectorAll('section[id]');
+const links = document.querySelectorAll('.topnav a[href^="#"]');
+const obs = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      links.forEach(l => l.classList.remove('active'));
+      const a = document.querySelector(`.topnav a[href="#${e.target.id}"]`);
+      if (a) a.classList.add('active');
+    }
+  });
+}, { threshold: 0.25 });
+sections.forEach(s => obs.observe(s));
+</script>
+</body>
+</html>

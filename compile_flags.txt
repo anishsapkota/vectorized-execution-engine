@@ -2,3 +2,4 @@
 -Isrc
 -Wall
 -Wextra
+-DWB_SRC_DIR="src"

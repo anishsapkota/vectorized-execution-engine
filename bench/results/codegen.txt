@@ -1,0 +1,39 @@
+readings 10000000 rows (153 segments), orders 2000000, customers 100000, iters 7, single-threaded
+Q1 Aggregate(group=none,[sum(1),count], Filter([0>1705026065], Scan(readings,[1,2])))
+Q2 Aggregate(group=none,[sum(0),count], Filter([0>50], Scan(readings,[2])))
+Q3 Aggregate(group=none,[sum(0),count], Filter([0>50,1<5000], Scan(readings,[2,0])))
+Q4 Aggregate(group=0,[sum(1),count], Scan(readings,[0,2]))
+Q5 Aggregate(group=3,[sum(1),count], HashJoin(0=0, Filter([1>50], Scan(orders,[0,1])), Scan(customers,[0,1])))
+Q6 Aggregate(group=0,[min(1),max(1),avg(1),count], Scan(readings,[0,2]))
+Q7 Aggregate(group=0,[median(1)], Scan(readings,[0,2]))
+Q8 Aggregate(group=none,[median(1)], Filter([0>1705026065], Scan(readings,[1,2])))
+Q9 Aggregate(group=3,[avg(1),median(1)], HashJoin(0=0, Filter([1>50], Scan(orders,[0,1])), Scan(customers,[0,1])))
+
+q   engine    gen ms compile ms  load ms    best ms  median ms  speedup break-even    allocs match
+Q1  vec            -          -        -       4.89       4.95    1.00x          -        36     -
+Q1  cg-O1       0.10       47.5   196.41       4.72       5.85    1.04x       1438        21   yes
+Q1  cg-O3       0.04       56.6   169.13       4.65       5.63    1.05x        934        21   yes
+Q2  vec            -          -        -       8.02       8.60    1.00x          -        32     -
+Q2  cg-O1       0.05       57.1   169.70      12.53      13.99    0.64x        inf        21   yes
+Q2  cg-O3       0.03       47.7   159.05      12.51      12.87    0.64x        inf        21   yes
+Q3  vec            -          -        -       7.19       7.42    1.00x          -        39     -
+Q3  cg-O1       0.04       47.9   157.01      34.20      35.27    0.21x        inf        22   yes
+Q3  cg-O3       0.03       49.1   165.94      33.28      34.06    0.22x        inf        22   yes
+Q4  vec            -          -        -      28.76      28.86    1.00x          -       172     -
+Q4  cg-O1       0.03       55.4   234.81      23.47      23.77    1.23x         55       117   yes
+Q4  cg-O3       0.03       66.8   158.70      12.36      13.47    2.33x         14       117   yes
+Q5  vec            -          -        -      11.47      11.51    1.00x          -       301     -
+Q5  cg-O1       0.04       68.5   186.12      14.88      15.95    0.77x        inf        72   yes
+Q5  cg-O3       0.04       98.1   167.34      12.36      13.56    0.93x        inf        72   yes
+Q6  vec            -          -        -      41.29      41.42    1.00x          -       247     -
+Q6  cg-O1       0.03       56.4   161.20      28.44      28.96    1.45x         17       183   yes
+Q6  cg-O3       0.03       64.2   166.05      20.60      20.75    2.00x         11       183   yes
+Q7  vec            -          -        -     158.81     162.51    1.00x          -       871     -
+Q7  cg-O1       0.03       71.6   161.25     153.50     155.38    1.03x         44        83   yes
+Q7  cg-O3       0.03       80.1   205.74     130.80     135.18    1.21x         10        83   yes
+Q8  vec            -          -        -      69.78      70.48    1.00x          -       375     -
+Q8  cg-O1       0.03       57.3   188.83      84.95      87.17    0.82x        inf        17   yes
+Q8  cg-O3       0.03       64.4   217.71      63.25      65.26    1.10x         43        17   yes
+Q9  vec            -          -        -      23.03      23.23    1.00x          -       397     -
+Q9  cg-O1       0.05       78.7   166.83      27.94      28.19    0.82x        inf        72   yes
+Q9  cg-O3       0.05      116.1   162.48      26.15      26.26    0.88x        inf        72   yes

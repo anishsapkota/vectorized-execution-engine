@@ -1,6 +1,7 @@
 // Correctness checks for column encodings, borrowed selection vectors and the CSV parser.
 // Each check compares the engine against a brute-force loop over the raw values.
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -204,4 +205,55 @@ TEST(csv) {
 TEST(chained_filters_f64) { check_chained_filters(false); }
 TEST(chained_filters_f32) { check_chained_filters(true); }
 
+TEST(raw_accessors) {
+    std::vector<int64_t> ints{-5, 70'000};
+    Int64Vector          v{ints};
+    CHECK(v.raw().width == 4);
+    CHECK(v.raw().base == -5);
+    CHECK(static_cast<const uint32_t*>(v.raw().codes)[1] == 70'005);
+
+    Float64Vector f{{1.5, 2.5}, true};
+    CHECK(f.raw().narrow);
+    CHECK(static_cast<const float*>(f.raw().values)[1] == 2.5f);
+}
+
+TEST(scan_start_row_public) {
+    const std::vector<IndexEntry> idx{{100, 0}, {200, 1024}, {300, 2048}};
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Gt, int64_t{250}}) == 1024);
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Eq, int64_t{100}}) == 0);
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Lt, int64_t{250}}) == 0);
+    CHECK(scan_start_row(idx, Predicate{0, CompareOp::Ge, int64_t{99}}) == 0);
+}
+
 }  // namespace
+
+TEST(int64_reset_plain_reuses_storage) {
+    Int64Vector v;
+    int64_t*    p = v.reset_plain(4096);
+    const int64_t values[] = {INT64_MIN, -1, 0, INT64_MAX};
+    for (int i = 0; i < 4; ++i)
+        p[i] = values[i];
+    for (int i = 0; i < 4; ++i)
+        CHECK(v.value(i) == values[i]);
+    CHECK(v.width_bytes() == 8);
+    CHECK(v.size() == 4096);
+    int64_t* q = v.reset_plain(100);
+    CHECK(q == p);
+    CHECK(v.size() == 100);
+}
+
+TEST(float64_reset_reuses_storage) {
+    Float64Vector v;
+    double*       p   = v.reset(4096);
+    const double  nan = std::bit_cast<double>(uint64_t{0x7FF8000000000123ULL});
+    p[0] = -0.0;
+    p[1] = nan;
+    p[2] = 1.5;
+    CHECK(std::bit_cast<uint64_t>(v.value(0)) == std::bit_cast<uint64_t>(-0.0));
+    CHECK(std::bit_cast<uint64_t>(v.value(1)) == std::bit_cast<uint64_t>(nan));
+    CHECK(v.value(2) == 1.5);
+    CHECK(!v.narrow());
+    double* q = v.reset(100);
+    CHECK(q == p);
+    CHECK(v.size() == 100);
+}

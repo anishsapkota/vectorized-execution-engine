@@ -25,10 +25,12 @@ class AggHashTable {
     Value& find_or_insert(int64_t key);
 
     std::size_t size() const { return size_; }
+    std::size_t capacity() const { return capacity_; }
 
     // Iterate all live entries. Callback signature: (int64_t key, const Value& val).
     template <typename F>
     void for_each(F&& f) const {
+        if (has_min_key_) f(kEmptyKey, min_key_value_);
         for (const auto& slot : slots_) {
             if (slot.key != kEmptyKey) f(slot.key, slot.value);
         }
@@ -44,7 +46,11 @@ class AggHashTable {
     void resize_(std::size_t new_capacity);
 
     std::vector<Slot> slots_;
-    std::size_t       size_     = 0;  // count of occupied slots;
+    std::size_t       size_     = 0;  // live keys, including the INT64_MIN key if present
     std::size_t       capacity_ = 0;  // == slots.size(), always power of 2
+
+    // INT64_MIN is the empty-slot marker, so that key lives outside the slot array.
+    bool  has_min_key_ = false;
+    Value min_key_value_;
 };
 }  // namespace wb

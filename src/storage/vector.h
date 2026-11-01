@@ -2,7 +2,6 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -22,6 +21,19 @@ class Vector {
     virtual std::size_t size() const = 0;
     // Heap bytes owned by this column (allocated capacity, not just size).
     virtual std::size_t memory_bytes() const = 0;
+};
+
+// Untyped view of a column's storage, for code that cannot use visit() (the codegen host binds
+// these pointers into generated code).
+struct Int64Raw {
+    const void*  codes;  // width-byte unsigned codes; value = base + code
+    int64_t      base;
+    std::uint8_t width;  // 1, 2, 4 or 8
+};
+
+struct Float64Raw {
+    const void* values;  // float if narrow, else double
+    bool        narrow;
 };
 
 // Frame-of-reference encoded int64 column. Stores `value - base` (base = column minimum) in the
@@ -55,6 +67,13 @@ class Int64Vector final : public Vector {
     // Scalar access, for cold paths. Hot loops should use visit().
     int64_t value(std::size_t i) const;
 
+    Int64Raw raw() const;
+
+    // For operator-owned output vectors only: turn this into an unencoded column of n values
+    // (width 8, base 0, so decoding is the identity) and return its storage for writing. Keeps
+    // the existing capacity, so refilling a batch-sized output column allocates nothing.
+    int64_t* reset_plain(std::size_t n);
+
    private:
     std::variant<std::vector<uint8_t>, std::vector<uint16_t>, std::vector<uint32_t>,
                  std::vector<uint64_t>>
@@ -85,6 +104,12 @@ class Float64Vector final : public Vector {
 
     // Scalar access, for cold paths. Hot loops should use visit().
     double value(std::size_t i) const;
+
+    Float64Raw raw() const;
+
+    // For operator-owned output vectors only: turn this into a double column of n values and
+    // return its storage for writing. Keeps the existing capacity.
+    double* reset(std::size_t n);
 
    private:
     std::variant<std::vector<double>, std::vector<float>> values_;

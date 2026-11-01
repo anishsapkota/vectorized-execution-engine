@@ -127,6 +127,40 @@ bool HashJoinOperator::load_probe_batch_() {
     return false;
 }
 
+void HashJoinOperator::init_output_() {
+    std::vector<DataType> types = column_types(*probe_batch_);
+    for (DataType t : column_types(build_rows_->as_batch()))
+        types.push_back(t);
+    for (DataType t : types) {
+        if (t == DataType::String) {
+            out_reusable_ = false;
+            out_vecs_.clear();
+            return;
+        }
+        if (t == DataType::Int64) out_vecs_.push_back(std::make_unique<Int64Vector>());
+        else out_vecs_.push_back(std::make_unique<Float64Vector>());
+    }
+    for (const auto& v : out_vecs_)
+        out_cols_.push_back(v.get());
+}
+
+void HashJoinOperator::gather_(Vector& out, const Vector& src, const std::vector<std::uint32_t>& rows) {
+    const std::size_t n = rows.size();
+    if (src.type() == DataType::Int64) {
+        int64_t* dst = static_cast<Int64Vector&>(out).reset_plain(n);
+        static_cast<const Int64Vector&>(src).visit([&](auto codes, int64_t base) {
+            for (std::size_t k = 0; k < n; ++k)
+                dst[k] = Int64Vector::decode(base, codes[rows[k]]);
+        });
+    } else {
+        double* dst = static_cast<Float64Vector&>(out).reset(n);
+        static_cast<const Float64Vector&>(src).visit([&](auto values) {
+            for (std::size_t k = 0; k < n; ++k)
+                dst[k] = static_cast<double>(values[rows[k]]);
+        });
+    }
+}
+
 std::optional<Batch> HashJoinOperator::next() {
     if (!built_) build_index_();
     if (buckets_.empty()) return std::nullopt;
@@ -157,9 +191,21 @@ std::optional<Batch> HashJoinOperator::next() {
     }
     if (out_probe_idx_.empty()) return std::nullopt;
 
-    // Gather the matched rows into owned columns: probe columns, then build columns.
+    if (out_vecs_.empty() && out_reusable_) init_output_();
+    const Batch build_batch = build_rows_->as_batch();
+    if (out_reusable_) {
+        // Gather into the operator-owned columns: probe columns, then build columns.
+        const std::size_t probe_cols = probe_batch_->num_columns();
+        for (std::size_t c = 0; c < probe_cols; ++c)
+            gather_(*out_vecs_[c], probe_batch_->column(c), out_probe_idx_);
+        for (std::size_t c = 0; c < build_batch.num_columns(); ++c)
+            gather_(*out_vecs_[probe_cols + c], build_batch.column(c), out_build_idx_);
+        return Batch{out_cols_, 0, static_cast<std::uint32_t>(out_probe_idx_.size())};
+    }
+
+    // Gather the matched rows into fresh owned columns: probe columns, then build columns.
     out_probe_builder_->append_rows(*probe_batch_, out_probe_idx_);
-    out_build_builder_->append_rows(build_rows_->as_batch(), out_build_idx_);
+    out_build_builder_->append_rows(build_batch, out_build_idx_);
     out_probe_ = out_probe_builder_->seal();
     out_build_ = out_build_builder_->seal();
 

@@ -1,0 +1,8 @@
+q4 vec [system] peak above loaded table: 0.8 MiB (0.0 B/row)
+q4 cg [system] peak above loaded table: 1.2 MiB (0.0 B/row)
+q7 vec [system] peak above loaded table: 790.7 MiB (8.3 B/row)
+q7 cg [system] peak above loaded table: 785.6 MiB (8.2 B/row)
+q8 vec [system] peak above loaded table: 767.9 MiB (8.1 B/row)
+q8 cg [system] peak above loaded table: 767.9 MiB (8.1 B/row)
+q7f vec [system] peak above loaded table: 399.5 MiB (4.2 B/row)
+q7f cg [system] peak above loaded table: 398.5 MiB (4.2 B/row)

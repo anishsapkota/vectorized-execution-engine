@@ -50,6 +50,8 @@ class HashJoinOperator final : public Operator {
     std::size_t   bucket_of_(int64_t key) const;
     // Pulls probe batches until one has a live row. Returns false when the probe side is done.
     bool load_probe_batch_();
+    void init_output_();
+    static void gather_(Vector& out, const Vector& src, const std::vector<std::uint32_t>& rows);
 
     std::unique_ptr<Operator> probe_;
     std::unique_ptr<Operator> build_;
@@ -71,11 +73,15 @@ class HashJoinOperator final : public Operator {
     std::uint32_t              match_pos_ = 0;  // build matches already emitted for probe_pos_
 
     // Output.
-    std::optional<ChunkBuilder>  out_probe_builder_;
-    std::optional<ChunkBuilder>  out_build_builder_;
-    std::shared_ptr<const Chunk> out_probe_;
-    std::shared_ptr<const Chunk> out_build_;
-    std::vector<const Vector*>   out_cols_;
+    // Output columns owned by the operator and refilled in place by every next() (Int64/Float64
+    // joins). A join with a String column falls back to sealing a fresh chunk per batch.
+    std::vector<std::unique_ptr<Vector>> out_vecs_;
+    bool                                 out_reusable_ = true;
+    std::optional<ChunkBuilder>          out_probe_builder_;
+    std::optional<ChunkBuilder>          out_build_builder_;
+    std::shared_ptr<const Chunk>         out_probe_;
+    std::shared_ptr<const Chunk>         out_build_;
+    std::vector<const Vector*>           out_cols_;
     std::vector<std::uint32_t>   out_probe_idx_;
     std::vector<std::uint32_t>   out_build_idx_;
 };
